@@ -1,0 +1,873 @@
+   600→   600→                      </div>
+   601→   601→                      <div className="flex gap-2">
+   602→   602→                        {messages.length > 0 && (
+   603→   603→                          <Tooltip>
+   604→   604→                            <TooltipTrigger asChild>
+   605→   605→                              <Button
+   606→   606→                                type="button"
+   607→   607→                                variant="ghost"
+   608→   608→                                size="icon"
+   609→   609→                                className="h-11 w-11 text-slate-400 hover:text-white rounded-xl"
+   610→   610→                                onClick={() => reload()}
+   611→   611→                                disabled={isLoading}
+   612→   612→                              >
+   613→   613→                                <RotateCcw className="w-4 h-4" />
+   614→   614→                              </Button>
+   615→   615→                            </TooltipTrigger>
+   616→   616→                            <TooltipContent>Gửi lại tin nhắn cuối</TooltipContent>
+   617→   617→                          </Tooltip>
+   618→   618→                        )}
+   619→   619→                        <Button
+   620→   620→                          type="submit"
+   621→   621→                          disabled={isLoading || !input?.trim()}
+   622→   622→                          className="h-11 px-5 rounded-xl bg-gradient-to-r from-violet-500 to-cyan-500 hover:from-violet-600 hover:to-cyan-600 text-white shadow-lg shadow-violet-500/20 transition-all"
+   623→   623→                        >
+   624→   624→                          <Send className="w-4 h-4" />
+   625→   625→                        </Button>
+   626→   626→                      </div>
+   627→   627→                    </form>
+   628→   628→                    <div className="flex items-center gap-3 mt-2 text-xs text-slate-500">
+   629→   629→                      <span className={`flex items-center gap-1 ${currentModel.textColor}`}>
+   630→   630→                        <currentModel.icon className="w-3 h-3" />
+   631→   631→                        {currentModel.name}
+   632→   632→                      </span>
+   633→   633→                      <span>·</span>
+   634→   634→                      <span>API: <span className="text-slate-400">{currentModel.apiBaseUrl}</span></span>
+   635→   635→                      <span>·</span>
+   636→   636→                      <span>Protocol: <span className="text-slate-400">OpenAI-compatible</span></span>
+   637→   637→                    </div>
+   638→   638→                  </div>
+   639→   639→                </div>
+   640→   640→
+   641→   641→                {/* Right Sidebar - Quick Info */}
+   642→   642→                <div className="hidden lg:flex flex-col gap-4">
+   643→   643→                  {/* Connection Status Card */}
+   644→   644→                  <Card className="bg-black/30 border-white/10 backdrop-blur-sm">
+   645→   645→                    <CardHeader className="pb-3">
+   646→   646→                      <CardTitle className="text-sm font-medium text-slate-300 flex items-center gap-2">
+   647→   647→                        <Activity className="w-4 h-4 text-emerald-400" />
+   648→   648→                        Trạng thái kết nối
+   649→   649→                      </CardTitle>
+   650→   650→                    </CardHeader>
+   651→   651→                    <CardContent className="space-y-3">
+   652→   652→                      <div className="flex items-center justify-between">
+   653→   653→                        <span className="text-xs text-slate-400">Model hiện tại</span>
+   654→   654→                        <Badge variant="outline" className={`text-[10px] px-2 py-0 ${currentModel.bgColor} ${currentModel.textColor}`}>
+   655→   655→                          {currentModel.name}
+   656→   656→                        </Badge>
+   657→   657→                      </div>
+   658→   658→                      <div className="flex items-center justify-between">
+   659→   659→                        <span className="text-xs text-slate-400">Provider</span>
+   660→   660→                        <span className="text-[10px] text-slate-300">{currentModel.provider}</span>
+   661→   661→                      </div>
+   662→   662→                      <div className="flex items-center justify-between">
+   663→   663→                        <span className="text-xs text-slate-400">Hermes Gateway</span>
+   664→   664→                        <Badge variant="outline" className={`text-[10px] px-2 py-0 ${isConnected ? 'border-emerald-500/50 text-emerald-400' : 'border-red-500/50 text-red-400'}`}>
+   665→   665→                          {isConnected ? 'Online' : 'Offline'}
+   666→   666→                        </Badge>
+   667→   667→                      </div>
+   668→   668→                      <div className="flex items-center justify-between">
+   669→   669→                        <span className="text-xs text-slate-400">Protocol</span>
+   670→   670→                        <span className="text-xs text-slate-300">OpenAI API</span>
+   671→   671→                      </div>
+   672→   672→                      <div className="flex items-center justify-between">
+   673→   673→                        <span className="text-xs text-slate-400">Sessions</span>
+   674→   674→                        <span className="text-xs text-slate-300">{sessions.length}</span>
+   675→   675→                      </div>
+   676→   676→                      <div className="flex items-center justify-between">
+   677→   677→                        <span className="text-xs text-slate-400">Skills</span>
+   678→   678→                        <span className="text-xs text-slate-300">{skills.length}</span>
+   679→   679→                      </div>
+   680→   680→                    </CardContent>
+   681→   681→                  </Card>
+   682→   682→
+   683→   683→                  {/* Integration Models */}
+   684→   684→                  <Card className="bg-black/30 border-white/10 backdrop-blur-sm">
+   685→   685→                    <CardHeader className="pb-3">
+   686→   686→                      <CardTitle className="text-sm font-medium text-slate-300 flex items-center gap-2">
+   687→   687→                        <Shield className="w-4 h-4 text-violet-400" />
+   688→   688→                        Mô hình kết nối
+   689→   689→                      </CardTitle>
+   690→   690→                    </CardHeader>
+   691→   691→                    <CardContent className="space-y-3">
+   692→   692→                      <div className="p-2.5 rounded-lg bg-violet-500/10 border border-violet-500/20">
+   693→   693→                        <div className="flex items-center gap-2 mb-1">
+   694→   694→                          <Server className="w-3.5 h-3.5 text-violet-400" />
+   695→   695→                          <span className="text-xs font-medium text-violet-300">Model Provider</span>
+   696→   696→                        </div>
+   697→   697→                        <p className="text-[10px] text-slate-400 leading-relaxed">
+   698→   698→                          Hermes làm endpoint LLM, Vercel AI SDK gọi như OpenAI API
+   699→   699→                        </p>
+   700→   700→                      </div>
+   701→   701→                      <div className="p-2.5 rounded-lg bg-cyan-500/10 border border-cyan-500/20">
+   702→   702→                        <div className="flex items-center gap-2 mb-1">
+   703→   703→                          <Wrench className="w-3.5 h-3.5 text-cyan-400" />
+   704→   704→                          <span className="text-xs font-medium text-cyan-300">Tool Executor (MCP)</span>
+   705→   705→                        </div>
+   706→   706→                        <p className="text-[10px] text-slate-400 leading-relaxed">
+   707→   707→                          Web UI gọi skill/tool của Hermes qua MCP protocol
+   708→   708→                        </p>
+   709→   709→                      </div>
+   710→   710→                    </CardContent>
+   711→   711→                  </Card>
+   712→   712→
+   713→   713→                  {/* Recent Sessions */}
+   714→   714→                  <Card className="bg-black/30 border-white/10 backdrop-blur-sm flex-1">
+   715→   715→                    <CardHeader className="pb-3">
+   716→   716→                      <CardTitle className="text-sm font-medium text-slate-300 flex items-center gap-2">
+   717→   717→                        <Clock className="w-4 h-4 text-amber-400" />
+   718→   718→                        Phiên gần đây
+   719→   719→                      </CardTitle>
+   720→   720→                    </CardHeader>
+   721→   721→                    <CardContent>
+   722→   722→                      <ScrollArea className="max-h-48">
+   723→   723→                        <div className="space-y-2">
+   724→   724→                          {sessions.slice(0, 5).map((session) => (
+   725→   725→                            <button
+   726→   726→                              key={session.id}
+   727→   727→                              onClick={() => setSelectedSession(session.id)}
+   728→   728→                              className={`w-full text-left p-2 rounded-lg border transition-all text-xs ${
+   729→   729→                                selectedSession === session.id
+   730→   730→                                  ? 'border-violet-500/50 bg-violet-500/10'
+   731→   731→                                  : 'border-white/5 bg-white/5 hover:bg-white/10'
+   732→   732→                              }`}
+   733→   733→                            >
+   734→   734→                              <div className="font-medium text-slate-300 truncate">{session.title}</div>
+   735→   735→                              <div className="flex items-center gap-2 mt-1 text-slate-500">
+   736→   736→                                <span>{session.message_count} tin nhắn</span>
+   737→   737→                                <span>·</span>
+   738→   738→                                <Badge variant="outline" className={`text-[9px] px-1.5 py-0 ${
+   739→   739→                                  session.status === 'active' ? 'border-emerald-500/50 text-emerald-400' : 'border-slate-500/50 text-slate-400'
+   740→   740→                                }`}>
+   741→   741→                                  {session.status}
+   742→   742→                                </Badge>
+   743→   743→                              </div>
+   744→   744→                            </button>
+   745→   745→                          ))}
+   746→   746→                        </div>
+   747→   747→                      </ScrollArea>
+   748→   748→                    </CardContent>
+   749→   749→                  </Card>
+   750→   750→                </div>
+   751→   751→              </div>
+   752→   752→            </TabsContent>
+   753→   753→
+   754→   754→            {/* Skills Tab */}
+   755→   755→            <TabsContent value="skills" className="mt-0">
+   756→   756→              <div className="space-y-4">
+   757→   757→                <div className="flex items-center justify-between">
+   758→   758→                  <div>
+   759→   759→                    <h2 className="text-xl font-bold">Hermes Skills & Tools</h2>
+   760→   760→                    <p className="text-sm text-slate-400 mt-1">Các kỹ năng và công cụ mà Hermes Agent sở hữu, có thể gọi từ giao diện web</p>
+   761→   761→                  </div>
+   762→   762→                  <Badge variant="outline" className="border-violet-500/50 text-violet-400 px-3">
+   763→   763→                    {skills.length} Skills
+   764→   764→                  </Badge>
+   765→   765→                </div>
+   766→   766→
+   767→   767→                {/* Toolsets */}
+   768→   768→                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+   769→   769→                  {toolsets.map((toolset) => (
+   770→   770→                    <motion.div
+   771→   771→                      key={toolset.name}
+   772→   772→                      initial={{ opacity: 0, y: 10 }}
+   773→   773→                      animate={{ opacity: 1, y: 0 }}
+   774→   774→                    >
+   775→   775→                      <Card className="bg-black/30 border-white/10 backdrop-blur-sm h-full hover:border-violet-500/30 transition-colors">
+   776→   776→                        <CardContent className="p-4">
+   777→   777→                          <div className="flex items-center gap-2 mb-2">
+   778→   778→                            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-violet-500/20 to-cyan-500/20 flex items-center justify-center">
+   779→   779→                              <Wrench className="w-4 h-4 text-violet-400" />
+   780→   780→                            </div>
+   781→   781→                            <div>
+   782→   782→                              <h3 className="text-sm font-medium text-white">{toolset.name}</h3>
+   783→   783→                              <p className="text-[10px] text-slate-500">{toolset.tools.length} tools</p>
+   784→   784→                            </div>
+   785→   785→                          </div>
+   786→   786→                          <p className="text-xs text-slate-400 mb-3">{toolset.description}</p>
+   787→   787→                          <div className="flex flex-wrap gap-1">
+   788→   788→                            {toolset.tools.slice(0, 4).map((tool) => (
+   789→   789→                              <Badge key={tool} variant="outline" className="text-[9px] px-1.5 py-0 border-white/10 text-slate-400">
+   790→   790→                                {tool}
+   791→   791→                              </Badge>
+   792→   792→                            ))}
+   793→   793→                            {toolset.tools.length > 4 && (
+   794→   794→                              <Badge variant="outline" className="text-[9px] px-1.5 py-0 border-white/10 text-slate-500">
+   795→   795→                                +{toolset.tools.length - 4}
+   796→   796→                              </Badge>
+   797→   797→                            )}
+   798→   798→                          </div>
+   799→   799→                        </CardContent>
+   800→   800→                      </Card>
+   801→   801→                    </motion.div>
+   802→   802→                  ))}
+   803→   803→                </div>
+   804→   804→
+   805→   805→                {/* Skills by Category */}
+   806→   806→                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+   807→   807→                  {Object.entries(skillsByCategory).map(([category, catSkills]) => {
+   808→   808→                    const Icon = categoryIcons[category] || Wrench;
+   809→   809→                    const colorClass = categoryColors[category] || 'text-slate-500 bg-slate-500/10';
+   810→   810→                    return (
+   811→   811→                      <motion.div
+   812→   812→                        key={category}
+   813→   813→                        initial={{ opacity: 0, y: 10 }}
+   814→   814→                        animate={{ opacity: 1, y: 0 }}
+   815→   815→                      >
+   816→   816→                        <Card className="bg-black/30 border-white/10 backdrop-blur-sm h-full">
+   817→   817→                          <CardHeader className="pb-3">
+   818→   818→                            <CardTitle className="text-sm font-medium flex items-center gap-2">
+   819→   819→                              <div className={`w-7 h-7 rounded-lg flex items-center justify-center ${colorClass}`}>
+   820→   820→                                <Icon className="w-3.5 h-3.5" />
+   821→   821→                              </div>
+   822→   822→                              <span className="capitalize text-slate-200">{category}</span>
+   823→   823→                              <Badge variant="outline" className="text-[10px] px-1.5 py-0 ml-auto border-white/10 text-slate-400">
+   824→   824→                                {catSkills.length}
+   825→   825→                              </Badge>
+   826→   826→                            </CardTitle>
+   827→   827→                          </CardHeader>
+   828→   828→                          <CardContent>
+   829→   829→                            <div className="space-y-2">
+   830→   830→                              {catSkills.map((skill) => (
+   831→   831→                                <div key={skill.name} className="flex items-start gap-2 p-2 rounded-lg bg-white/5 hover:bg-white/10 transition-colors">
+   832→   832→                                  <ChevronRight className="w-3 h-3 text-violet-400 mt-0.5 shrink-0" />
+   833→   833→                                  <div>
+   834→   834→                                    <div className="text-xs font-medium text-slate-300">{skill.name}</div>
+   835→   835→                                    <div className="text-[10px] text-slate-500">{skill.description}</div>
+   836→   836→                                  </div>
+   837→   837→                                </div>
+   838→   838→                              ))}
+   839→   839→                            </div>
+   840→   840→                          </CardContent>
+   841→   841→                        </Card>
+   842→   842→                      </motion.div>
+   843→   843→                    );
+   844→   844→                  })}
+   845→   845→                </div>
+   846→   846→              </div>
+   847→   847→            </TabsContent>
+   848→   848→
+   849→   849→            {/* Architecture Tab */}
+   850→   850→            <TabsContent value="architecture" className="mt-0">
+   851→   851→              <div className="space-y-6">
+   852→   852→                <div>
+   853→   853→                  <h2 className="text-xl font-bold">Kiến trúc Kết hợp</h2>
+   854→   854→                  <p className="text-sm text-slate-400 mt-1">Vercel AI SDK là "cơ thể" giao diện web, Hermes Agent là "bộ não" tự trị</p>
+   855→   855→                </div>
+   856→   856→
+   857→   857→                {/* Architecture Diagram */}
+   858→   858→                <div className="rounded-2xl border border-white/10 bg-black/30 backdrop-blur-sm p-6 overflow-x-auto">
+   859→   859→                  <div className="min-w-[500px]">
+   860→   860→                    <svg width="100%" viewBox="0 0 500 520" className="mx-auto">
+   861→   861→                      {/* Connections */}
+   862→   862→                      {archConnections.map((conn, i) => {
+   863→   863→                        const from = archNodes.find(n => n.id === conn.from)!;
+   864→   864→                        const to = archNodes.find(n => n.id === conn.to)!;
+   865→   865→                        const x1 = from.x + 60;
+   866→   866→                        const y1 = from.y + 25;
+   867→   867→                        const x2 = to.x + 60;
+   868→   868→                        const y2 = to.y + 25;
+   869→   869→                        
+   870→   870→                        return (
+   871→   871→                          <g key={i}>
+   872→   872→                            <line
+   873→   873→                              x1={x1} y1={y1} x2={x2} y2={y2}
+   874→   874→                              stroke="rgba(139,92,246,0.3)"
+   875→   875→                              strokeWidth="2"
+   876→   876→                              strokeDasharray="6,4"
+   877→   877→                            />
+   878→   878→                            <text
+   879→   879→                              x={(x1 + x2) / 2}
+   880→   880→                              y={(y1 + y2) / 2 - 8}
+   881→   881→                              textAnchor="middle"
+   882→   882→                              fill="rgba(148,163,184,0.7)"
+   883→   883→                              fontSize="10"
+   884→   884→                            >
+   885→   885→                              {conn.label}
+   886→   886→                            </text>
+   887→   887→                          </g>
+   888→   888→                        );
+   889→   889→                      })}
+   890→   890→
+   891→   891→                      {/* Nodes */}
+   892→   892→                      {archNodes.map((node) => {
+   893→   893→                        const Icon = node.icon;
+   894→   894→                        return (
+   895→   895→                          <g key={node.id}>
+   896→   896→                            <rect
+   897→   897→                              x={node.x}
+   898→   898→                              y={node.y}
+   899→   899→                              width="120"
+   900→   900→                              height="50"
+   901→   901→                              rx="12"
+   902→   902→                              fill="rgba(15,23,42,0.8)"
+   903→   903→                              stroke="rgba(255,255,255,0.1)"
+   904→   904→                              strokeWidth="1"
+   905→   905→                            />
+   906→   906→                            <defs>
+   907→   907→                              <linearGradient id={`grad-${node.id}`} x1="0%" y1="0%" x2="100%" y2="100%">
+   908→   908→                                <stop offset="0%" stopColor={node.color.includes('violet') ? '#8b5cf6' : node.color.includes('cyan') ? '#06b6d4' : node.color.includes('emerald') ? '#10b981' : node.color.includes('orange') ? '#f97316' : node.color.includes('rose') ? '#f43f5e' : node.color.includes('teal') ? '#14b8a6' : node.color.includes('amber') ? '#f59e0b' : node.color.includes('blue') ? '#3b82f6' : '#8b5cf6'} />
+   909→   909→                                <stop offset="100%" stopColor={node.color.includes('violet') ? '#7c3aed' : node.color.includes('cyan') ? '#0891b2' : node.color.includes('emerald') ? '#059669' : node.color.includes('orange') ? '#ea580c' : node.color.includes('rose') ? '#e11d48' : node.color.includes('teal') ? '#0d9488' : node.color.includes('amber') ? '#d97706' : node.color.includes('blue') ? '#2563eb' : '#7c3aed'} />
+   910→   910→                              </linearGradient>
+   911→   911→                            </defs>
+   912→   912→                            <rect
+   913→   913→                              x={node.x}
+   914→   914→                              y={node.y}
+   915→   915→                              width="120"
+   916→   916→                              height="50"
+   917→   917→                              rx="12"
+   918→   918→                              fill={`url(#grad-${node.id})`}
+   919→   919→                              opacity="0.15"
+   920→   920→                            />
+   921→   921→                            {/* Icon placeholder */}
+   922→   922→                            <foreignObject x={node.x + 10} y={node.y + 12} width="26" height="26">
+   923→   923→                              <div className="flex items-center justify-center w-full h-full">
+   924→   924→                                <Icon className="w-5 h-5 text-white opacity-80" />
+   925→   925→                              </div>
+   926→   926→                            </foreignObject>
+   927→   927→                            <text
+   928→   928→                              x={node.x + 42}
+   929→   929→                              y={node.y + (node.label.includes('\n') ? 22 : 30)}
+   930→   930→                              fill="white"
+   931→   931→                              fontSize="11"
+   932→   932→                              fontWeight="500"
+   933→   933→                            >
+   934→   934→                              {node.label.split('\n')[0]}
+   935→   935→                            </text>
+   936→   936→                            {node.label.includes('\n') && (
+   937→   937→                              <text
+   938→   938→                                x={node.x + 42}
+   939→   939→                                y={node.y + 36}
+   940→   940→                                fill="rgba(148,163,184,0.8)"
+   941→   941→                                fontSize="10"
+   942→   942→                              >
+   943→   943→                                {node.label.split('\n')[1]}
+   944→   944→                              </text>
+   945→   945→                            )}
+   946→   946→                          </g>
+   947→   947→                        );
+   948→   948→                      })}
+   949→   949→                    </svg>
+   950→   950→                  </div>
+   951→   951→                </div>
+   952→   952→
+   953→   953→                {/* Two Connection Models */}
+   954→   954→                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+   955→   955→                  {/* Model 1: Model Provider */}
+   956→   956→                  <motion.div
+   957→   957→                    initial={{ opacity: 0, x: -20 }}
+   958→   958→                    animate={{ opacity: 1, x: 0 }}
+   959→   959→                  >
+   960→   960→                    <Card className="bg-black/30 border-violet-500/20 backdrop-blur-sm h-full">
+   961→   961→                      <CardHeader>
+   962→   962→                        <div className="flex items-center gap-3">
+   963→   963→                          <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-500 to-violet-600 flex items-center justify-center">
+   964→   964→                            <Server className="w-5 h-5 text-white" />
+   965→   965→                          </div>
+   966→   966→                          <div>
+   967→   967→                            <CardTitle className="text-base">Mô hình 1: Model Provider</CardTitle>
+   968→   968→                            <p className="text-xs text-slate-400 mt-0.5">Hermes là endpoint LLM cho Vercel AI SDK</p>
+   969→   969→                          </div>
+   970→   970→                        </div>
+   971→   971→                      </CardHeader>
+   972→   972→                      <CardContent className="space-y-4">
+   973→   973→                        <div className="p-3 rounded-xl bg-slate-800/50 border border-white/5 font-mono text-xs text-slate-300 leading-relaxed">
+   974→   974→                          <span className="text-violet-400">import</span> {'{ createOpenAI }'} <span className="text-violet-400">from</span> <span className="text-emerald-400">&apos;@ai-sdk/openai&apos;</span>;{'\n'}
+   975→   975→                          <span className="text-violet-400">import</span> {'{ streamText }'} <span className="text-violet-400">from</span> <span className="text-emerald-400">&apos;ai&apos;</span>;{'\n\n'}
+   976→   976→                          <span className="text-violet-400">const</span> <span className="text-cyan-400">hermes</span> = <span className="text-amber-400">createOpenAI</span>({'{'}
+   977→   977→                          {'\n'}  baseURL: <span className="text-emerald-400">&apos;http://localhost:8642/v1&apos;</span>,
+   978→   978→                          {'\n'}  apiKey: <span className="text-emerald-400">&apos;hermes-local&apos;</span>
+   979→   979→                          {'\n'}{'}'});{'\n\n'}
+   980→   980→                          <span className="text-violet-400">const</span> result = <span className="text-amber-400">streamText</span>({'{'}
+   981→   981→                          {'\n'}  model: hermes(<span className="text-emerald-400">&apos;hermes-agent&apos;</span>),
+   982→   982→                          {'\n'}  messages,
+   983→   983→                          {'\n'}  headers: {'{'}
+   984→   984→                          {'\n'}    <span className="text-emerald-400">&apos;X-Hermes-Session-Id&apos;</span>: sessionId
+   985→   985→                          {'\n'}  {'}'}
+   986→   986→                          {'\n'}{'}'});
+   987→   987→                        </div>
+   988→   988→                        <div className="space-y-2">
+   989→   989→                          <h4 className="text-xs font-medium text-slate-300">Lợi ích</h4>
+   990→   990→                          <div className="flex items-start gap-2">
+   991→   991→                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 mt-0.5 shrink-0" />
+   992→   992→                            <span className="text-xs text-slate-400">Ứng dụng web có ngay trí nhớ dài hạn từ Hermes</span>
+   993→   993→                          </div>
+   994→   994→                          <div className="flex items-start gap-2">
+   995→   995→                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 mt-0.5 shrink-0" />
+   996→   996→                            <span className="text-xs text-slate-400">Streaming UI mượt mà với useChat hook</span>
+   997→   997→                          </div>
+   998→   998→                          <div className="flex items-start gap-2">
+   999→   999→                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 mt-0.5 shrink-0" />
+  1000→  1000→                            <span className="text-xs text-slate-400">Tương thích mọi frontend hỗ trợ OpenAI API</span>
+  1001→  1001→                          </div>
+  1002→  1002→                        </div>
+  1003→  1003→                      </CardContent>
+  1004→  1004→                    </Card>
+  1005→  1005→                  </motion.div>
+  1006→  1006→
+  1007→  1007→                  {/* Model 2: Tool Executor (MCP) */}
+  1008→  1008→                  <motion.div
+  1009→  1009→                    initial={{ opacity: 0, x: 20 }}
+  1010→  1010→                    animate={{ opacity: 1, x: 0 }}
+  1011→  1011→                  >
+  1012→  1012→                    <Card className="bg-black/30 border-cyan-500/20 backdrop-blur-sm h-full">
+  1013→  1013→                      <CardHeader>
+  1014→  1014→                        <div className="flex items-center gap-3">
+  1015→  1015→                          <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-cyan-500 to-cyan-600 flex items-center justify-center">
+  1016→  1016→                            <Wrench className="w-5 h-5 text-white" />
+  1017→  1017→                          </div>
+  1018→  1018→                          <div>
+  1019→  1019→                            <CardTitle className="text-base">Mô hình 2: Tool Executor (MCP)</CardTitle>
+  1020→  1020→                            <p className="text-xs text-slate-400 mt-0.5">Hermes thực thi công cụ qua MCP protocol</p>
+  1021→  1021→                          </div>
+  1022→  1022→                        </div>
+  1023→  1023→                      </CardHeader>
+  1024→  1024→                      <CardContent className="space-y-4">
+  1025→  1025→                        <div className="p-3 rounded-xl bg-slate-800/50 border border-white/5 font-mono text-xs text-slate-300 leading-relaxed">
+  1026→  1026→                          <span className="text-slate-500"># ~/.hermes/config.yaml</span>{'\n'}
+  1027→  1027→                          <span className="text-cyan-400">mcp_servers</span>:{'\n'}
+  1028→  1028→                          {'  '}<span className="text-amber-400">web-tools</span>:{'\n'}
+  1029→  1029→                          {'    '}<span className="text-cyan-400">command</span>: npx{'\n'}
+  1030→  1030→                          {'    '}<span className="text-cyan-400">args</span>:{'\n'}
+  1031→  1031→                          {'      '}- <span className="text-emerald-400">&quot;-y&quot;</span>{'\n'}
+  1032→  1032→                          {'      '}- <span className="text-emerald-400">&quot;@modelcontextprotocol/server-web-tools&quot;</span>
+  1033→  1033→                        </div>
+  1034→  1034→                        <div className="space-y-2">
+  1035→  1035→                          <h4 className="text-xs font-medium text-slate-300">Lợi ích</h4>
+  1036→  1036→                          <div className="flex items-start gap-2">
+  1037→  1037→                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 mt-0.5 shrink-0" />
+  1038→  1038→                            <span className="text-xs text-slate-400">Tận dụng skill hệ sinh thái phong phú của Hermes từ web UI</span>
+  1039→  1039→                          </div>
+  1040→  1040→                          <div className="flex items-start gap-2">
+  1041→  1041→                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 mt-0.5 shrink-0" />
+  1042→  1042→                            <span className="text-xs text-slate-400">Chạy shell, duyệt web, gửi email trực tiếp từ dashboard</span>
+  1043→  1043→                          </div>
+  1044→  1044→                          <div className="flex items-start gap-2">
+  1045→  1045→                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 mt-0.5 shrink-0" />
+  1046→  1046→                            <span className="text-xs text-slate-400">MCP protocol linh hoạt — dễ thêm server mới</span>
+  1047→  1047→                          </div>
+  1048→  1048→                        </div>
+  1049→  1049→                      </CardContent>
+  1050→  1050→                    </Card>
+  1051→  1051→                  </motion.div>
+  1052→  1052→                </div>
+  1053→  1053→
+  1054→  1054→                {/* API Endpoints Reference */}
+  1055→  1055→                <Card className="bg-black/30 border-white/10 backdrop-blur-sm">
+  1056→  1056→                  <CardHeader>
+  1057→  1057→                    <CardTitle className="text-base flex items-center gap-2">
+  1058→  1058→                      <Code2 className="w-5 h-5 text-violet-400" />
+  1059→  1059→                      Hermes API Endpoints
+  1060→  1060→                    </CardTitle>
+  1061→  1061→                  </CardHeader>
+  1062→  1062→                  <CardContent>
+  1063→  1063→                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+  1064→  1064→                      {[
+  1065→  1065→                        { method: 'POST', path: '/v1/chat/completions', desc: 'OpenAI Chat Completions', color: 'text-emerald-400' },
+  1066→  1066→                        { method: 'POST', path: '/v1/responses', desc: 'OpenAI Responses API', color: 'text-emerald-400' },
+  1067→  1067→                        { method: 'GET', path: '/v1/models', desc: 'Danh sách models', color: 'text-cyan-400' },
+  1068→  1068→                        { method: 'GET', path: '/v1/skills', desc: 'Danh sách skills', color: 'text-cyan-400' },
+  1069→  1069→                        { method: 'GET', path: '/v1/toolsets', desc: 'Danh sách toolsets', color: 'text-cyan-400' },
+  1070→  1070→                        { method: 'GET', path: '/v1/capabilities', desc: 'Khả năng API', color: 'text-cyan-400' },
+  1071→  1071→                        { method: 'GET', path: '/api/sessions', desc: 'Danh sách sessions', color: 'text-amber-400' },
+  1072→  1072→                        { method: 'POST', path: '/v1/runs', desc: 'Chạy tác vụ async', color: 'text-emerald-400' },
+  1073→  1073→                        { method: 'GET', path: '/health/detailed', desc: 'Health check', color: 'text-cyan-400' },
+  1074→  1074→                      ].map((ep, i) => (
+  1075→  1075→                        <div key={i} className="flex items-center gap-2 p-2 rounded-lg bg-white/5 border border-white/5">
+  1076→  1076→                          <span className={`text-[10px] font-bold ${ep.color} shrink-0 w-10`}>{ep.method}</span>
+  1077→  1077→                          <code className="text-[10px] text-slate-300 truncate flex-1">{ep.path}</code>
+  1078→  1078→                          <span className="text-[10px] text-slate-500 shrink-0">{ep.desc}</span>
+  1079→  1079→                        </div>
+  1080→  1080→                      ))}
+  1081→  1081→                    </div>
+  1082→  1082→                  </CardContent>
+  1083→  1083→                </Card>
+  1084→  1084→              </div>
+  1085→  1085→            </TabsContent>
+  1086→  1086→
+  1087→  1087→            {/* Sessions Tab */}
+  1088→  1088→            <TabsContent value="sessions" className="mt-0">
+  1089→  1089→              <div className="space-y-4">
+  1090→  1090→                <div className="flex items-center justify-between">
+  1091→  1091→                  <div>
+  1092→  1092→                    <h2 className="text-xl font-bold">Phiên làm việc</h2>
+  1093→  1093→                    <p className="text-sm text-slate-400 mt-1">Các phiên hội thoại với Hermes Agent, được lưu trữ bền vững</p>
+  1094→  1094→                  </div>
+  1095→  1095→                  <Badge variant="outline" className="border-violet-500/50 text-violet-400 px-3">
+  1096→  1096→                    {sessions.length} Phiên
+  1097→  1097→                  </Badge>
+  1098→  1098→                </div>
+  1099→  1099→
+  1100→  1100→                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+  1101→  1101→                  {sessions.map((session, i) => (
+  1102→  1102→                    <motion.div
+  1103→  1103→                      key={session.id}
+  1104→  1104→                      initial={{ opacity: 0, y: 10 }}
+  1105→  1105→                      animate={{ opacity: 1, y: 0 }}
+  1106→  1106→                      transition={{ delay: i * 0.05 }}
+  1107→  1107→                    >
+  1108→  1108→                      <Card className="bg-black/30 border-white/10 backdrop-blur-sm hover:border-violet-500/30 transition-colors cursor-pointer group">
+  1109→  1109→                        <CardContent className="p-4">
+  1110→  1110→                          <div className="flex items-start justify-between mb-3">
+  1111→  1111→                            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-500/20 to-cyan-500/20 border border-white/10 flex items-center justify-center group-hover:border-violet-500/30 transition-colors">
+  1112→  1112→                              <MessageSquare className="w-5 h-5 text-violet-400" />
+  1113→  1113→                            </div>
+  1114→  1114→                            <Badge variant="outline" className={`text-[10px] px-2 py-0 ${
+  1115→  1115→                              session.status === 'active' ? 'border-emerald-500/50 text-emerald-400' : 'border-slate-500/50 text-slate-400'
+  1116→  1116→                            }`}>
+  1117→  1117→                              {session.status}
+  1118→  1118→                            </Badge>
+  1119→  1119→                          </div>
+  1120→  1120→                          <h3 className="text-sm font-medium text-white mb-1 group-hover:text-violet-300 transition-colors">
+  1121→  1121→                            {session.title}
+  1122→  1122→                          </h3>
+  1123→  1123→                          <div className="flex items-center gap-3 text-[10px] text-slate-500">
+  1124→  1124→                            <span className="flex items-center gap-1">
+  1125→  1125→                              <MessageSquare className="w-3 h-3" />
+  1126→  1126→                              {session.message_count} tin nhắn
+  1127→  1127→                            </span>
+  1128→  1128→                            <span className="flex items-center gap-1">
+  1129→  1129→                              <Clock className="w-3 h-3" />
+  1130→  1130→                              {new Date(session.updated_at).toLocaleDateString('vi-VN')}
+  1131→  1131→                            </span>
+  1132→  1132→                          </div>
+  1133→  1133→                          <div className="flex items-center gap-2 mt-3 pt-3 border-t border-white/5">
+  1134→  1134→                            <Button variant="ghost" size="sm" className="h-7 text-xs text-slate-400 hover:text-white">
+  1135→  1135→                              Tiếp tục
+  1136→  1136→                              <ArrowRight className="w-3 h-3 ml-1" />
+  1137→  1137→                            </Button>
+  1138→  1138→                            <Button variant="ghost" size="sm" className="h-7 text-xs text-slate-400 hover:text-white">
+  1139→  1139→                              Fork
+  1140→  1140→                            </Button>
+  1141→  1141→                          </div>
+  1142→  1142→                        </CardContent>
+  1143→  1143→                      </Card>
+  1144→  1144→                    </motion.div>
+  1145→  1145→                  ))}
+  1146→  1146→                </div>
+  1147→  1147→
+  1148→  1148→                {/* Setup Guide when no sessions */}
+  1149→  1149→                {sessions.length === 0 && (
+  1150→  1150→                  <Card className="bg-black/30 border-white/10 backdrop-blur-sm">
+  1151→  1151→                    <CardContent className="p-8 text-center">
+  1152→  1152→                      <div className="w-16 h-16 rounded-2xl bg-violet-500/10 border border-violet-500/20 flex items-center justify-center mx-auto mb-4">
+  1153→  1153→                        <Bot className="w-8 h-8 text-violet-400" />
+  1154→  1154→                      </div>
+  1155→  1155→                      <h3 className="text-lg font-medium text-white mb-2">Chưa có phiên nào</h3>
+  1156→  1156→                      <p className="text-sm text-slate-400 mb-4">Khởi động Hermes Gateway để bắt đầu tạo phiên hội thoại</p>
+  1157→  1157→                      <div className="p-3 rounded-xl bg-slate-800/50 border border-white/5 font-mono text-xs text-slate-300 inline-block">
+  1158→  1158→                        $ hermes gateway
+  1159→  1159→                      </div>
+  1160→  1160→                    </CardContent>
+  1161→  1161→                  </Card>
+  1162→  1162→                )}
+  1163→  1163→              </div>
+  1164→  1164→            </TabsContent>
+  1165→  1165→
+  1166→  1166→            {/* Search Tab - Perplexity-style Smart Search */}
+  1167→  1167→            <TabsContent value="search" className="flex-1 mt-0">
+  1168→  1168→              <div className="space-y-4">
+  1169→  1169→                {/* Search Header */}
+  1170→  1170→                <div>
+  1171→  1171→                  <h2 className="text-xl font-bold flex items-center gap-2">
+  1172→  1172→                    <Sparkles className="w-5 h-5 text-orange-400" />
+  1173→  1173→                    Tìm kiếm thông minh
+  1174→  1174→                  </h2>
+  1175→  1175→                  <p className="text-sm text-slate-400 mt-1">Tìm kiếm thông tin từ web, địa điểm, cửa hàng, giấy phép kinh doanh — không cần API trả phí</p>
+  1176→  1176→                </div>
+  1177→  1177→
+  1178→  1178→                {/* Search Input */}
+  1179→  1179→                <div className="relative">
+  1180→  1180→                  <div className="flex gap-3">
+  1181→  1181→                    <div className="flex-1 relative">
+  1182→  1182→                      <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" />
+  1183→  1183→                      <input
+  1184→  1184→                        type="text"
+  1185→  1185→                        value={searchQuery}
+  1186→  1186→                        onChange={(e) => setSearchQuery(e.target.value)}
+  1187→  1187→                        onKeyDown={(e) => { if (e.key === 'Enter') handleSearch(); }}
+  1188→  1188→                        placeholder="Tìm cửa hàng, địa điểm, giấy phép kinh doanh..."
+  1189→  1189→                        className="w-full rounded-xl border border-white/10 bg-white/5 pl-12 pr-4 py-3.5 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-orange-500/50 focus:border-orange-500/50"
+  1190→  1190→                        disabled={isSearching}
+  1191→  1191→                      />
+  1192→  1192→                    </div>
+  1193→  1193→                    {/* Search Mode Selector */}
+  1194→  1194→                    <div className="flex rounded-xl border border-white/10 overflow-hidden">
+  1195→  1195→                      {[
+  1196→  1196→                        { mode: 'smart' as const, label: 'Thông minh', icon: Sparkles },
+  1197→  1197→                        { mode: 'places' as const, label: 'Địa điểm', icon: MapPin },
+  1198→  1198→                        { mode: 'business' as const, label: 'Doanh nghiệp', icon: Building2 },
+  1199→  1199→                      ].map((m) => (
+  1200→  1200→                        <button
+  1201→  1201→                          key={m.mode}
+  1202→  1202→                          onClick={() => setSearchMode(m.mode)}
+  1203→  1203→                          className={`flex items-center gap-1.5 px-3 py-2 text-xs transition-all ${
+  1204→  1204→                            searchMode === m.mode
+  1205→  1205→                              ? 'bg-orange-500/20 text-orange-300 border-r border-white/10'
+  1206→  1206→                              : 'bg-white/5 text-slate-400 hover:bg-white/10 border-r border-white/10 last:border-r-0'
+  1207→  1207→                          }`}
+  1208→  1208→                        >
+  1209→  1209→                          <m.icon className="w-3.5 h-3.5" />
+  1210→  1210→                          <span className="hidden sm:inline">{m.label}</span>
+  1211→  1211→                        </button>
+  1212→  1212→                      ))}
+  1213→  1213→                    </div>
+  1214→  1214→                    <Button
+  1215→  1215→                      onClick={handleSearch}
+  1216→  1216→                      disabled={isSearching || !searchQuery.trim()}
+  1217→  1217→                      data-search-btn
+  1218→  1218→                      className="px-5 rounded-xl bg-gradient-to-r from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 text-white shadow-lg shadow-orange-500/20"
+  1219→  1219→                    >
+  1220→  1220→                      {isSearching ? (
+  1221→  1221→                        <Loader2 className="w-4 h-4 animate-spin" />
+  1222→  1222→                      ) : (
+  1223→  1223→                        <Search className="w-4 h-4" />
+  1224→  1224→                      )}
+  1225→  1225→                    </Button>
+  1226→  1226→                  </div>
+  1227→  1227→                </div>
+  1228→  1228→
+  1229→  1229→                {/* Quick Search Suggestions */}
+  1230→  1230→                {!searchResult && !isSearching && (
+  1231→  1231→                  <div className="space-y-4">
+  1232→  1232→                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+  1233→  1233→                      {[
+  1234→  1234→                        { icon: Building2, text: 'Cửa hàng tiện lợi tại TP.HCM', mode: 'places' as const, color: 'text-emerald-400 bg-emerald-500/10' },
+  1235→  1235→                        { icon: FileCheck, text: 'Giấy phép kinh doanh quán cafe', mode: 'business' as const, color: 'text-amber-400 bg-amber-500/10' },
+  1236→  1236→                        { icon: MapPin, text: 'Nhà hàng Quận 1 TP.HCM', mode: 'places' as const, color: 'text-cyan-400 bg-cyan-500/10' },
+  1237→  1237→                        { icon: BookOpen, text: 'Quy định đăng ký kinh doanh 2026', mode: 'smart' as const, color: 'text-violet-400 bg-violet-500/10' },
+  1238→  1238→                        { icon: Building2, text: 'Phòng khám tư nhân Hà Nội', mode: 'business' as const, color: 'text-rose-400 bg-rose-500/10' },
+  1239→  1239→                        { icon: Lightbulb, text: 'Xu hướng kinh doanh năm 2026', mode: 'smart' as const, color: 'text-orange-400 bg-orange-500/10' },
+  1240→  1240→                      ].map((suggestion, i) => (
+  1241→  1241→                        <motion.button
+  1242→  1242→                          key={i}
+  1243→  1243→                          initial={{ opacity: 0, y: 10 }}
+  1244→  1244→                          animate={{ opacity: 1, y: 0 }}
+  1245→  1245→                          transition={{ delay: i * 0.05 }}
+  1246→  1246→                          onClick={() => {
+  1247→  1247→                            setSearchQuery(suggestion.text);
+  1248→  1248→                            setSearchMode(suggestion.mode);
+  1249→  1249→                            // Auto-search: set query param and trigger via ref
+  1250→  1250→                            setTimeout(() => {
+  1251→  1251→                              const searchBtn = document.querySelector('[data-search-btn]') as HTMLButtonElement;
+  1252→  1252→                              if (searchBtn) searchBtn.click();
+  1253→  1253→                            }, 200);
+  1254→  1254→                          }}
+  1255→  1255→                          className="flex items-center gap-3 p-3 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 transition-all text-left group"
+  1256→  1256→                        >
+  1257→  1257→                          <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${suggestion.color}`}>
+  1258→  1258→                            <suggestion.icon className="w-4 h-4" />
+  1259→  1259→                          </div>
+  1260→  1260→                          <span className="text-sm text-slate-300 group-hover:text-white transition-colors">{suggestion.text}</span>
+  1261→  1261→                        </motion.button>
+  1262→  1262→                      ))}
+  1263→  1263→                    </div>
+  1264→  1264→
+  1265→  1265→                    {/* Search History */}
+  1266→  1266→                    {searchHistory.length > 0 && (
+  1267→  1267→                      <div>
+  1268→  1268→                        <h3 className="text-xs text-slate-500 uppercase tracking-wider mb-2">Tìm kiếm gần đây</h3>
+  1269→  1269→                        <div className="flex flex-wrap gap-2">
+  1270→  1270→                          {searchHistory.slice(0, 5).map((q, i) => (
+  1271→  1271→                            <button
+  1272→  1272→                              key={i}
+  1273→  1273→                              onClick={() => setSearchQuery(q)}
+  1274→  1274→                              className="px-3 py-1 rounded-full border border-white/10 bg-white/5 text-xs text-slate-400 hover:text-white hover:bg-white/10 transition-all"
+  1275→  1275→                            >
+  1276→  1276→                              {q}
+  1277→  1277→                            </button>
+  1278→  1278→                          ))}
+  1279→  1279→                        </div>
+  1280→  1280→                      </div>
+  1281→  1281→                    )}
+  1282→  1282→
+  1283→  1283→                    {/* How it works */}
+  1284→  1284→                    <Card className="bg-black/30 border-white/10 backdrop-blur-sm">
+  1285→  1285→                      <CardContent className="p-5">
+  1286→  1286→                        <h3 className="text-sm font-medium text-slate-300 mb-3">Cách hoạt động</h3>
+  1287→  1287→                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+  1288→  1288→                          <div className="flex items-start gap-2">
+  1289→  1289→                            <div className="w-6 h-6 rounded-full bg-orange-500/20 flex items-center justify-center shrink-0 text-xs text-orange-400 font-bold">1</div>
+  1290→  1290→                            <div>
+  1291→  1291→                              <p className="text-xs font-medium text-slate-300">Tìm kiếm web</p>
+  1292→  1292→                              <p className="text-[10px] text-slate-500">z-ai-web-dev-sdk tìm kiếm nhiều nguồn</p>
+  1293→  1293→                            </div>
+  1294→  1294→                          </div>
+  1295→  1295→                          <div className="flex items-start gap-2">
+  1296→  1296→                            <div className="w-6 h-6 rounded-full bg-orange-500/20 flex items-center justify-center shrink-0 text-xs text-orange-400 font-bold">2</div>
+  1297→  1297→                            <div>
+  1298→  1298→                              <p className="text-xs font-medium text-slate-300">Đọc & phân tích</p>
+  1299→  1299→                              <p className="text-[10px] text-slate-500">Qwen 3.5 Flash tổng hợp thông tin</p>
+  1300→  1300→                            </div>
+  1301→  1301→                          </div>
+  1302→  1302→                          <div className="flex items-start gap-2">
+  1303→  1303→                            <div className="w-6 h-6 rounded-full bg-orange-500/20 flex items-center justify-center shrink-0 text-xs text-orange-400 font-bold">3</div>
+  1304→  1304→                            <div>
+  1305→  1305→                              <p className="text-xs font-medium text-slate-300">Trả lời + Bản đồ</p>
+  1306→  1306→                              <p className="text-[10px] text-slate-500">OpenStreetMap hiển thị địa điểm</p>
+  1307→  1307→                            </div>
+  1308→  1308→                          </div>
+  1309→  1309→                        </div>
+  1310→  1310→                      </CardContent>
+  1311→  1311→                    </Card>
+  1312→  1312→                  </div>
+  1313→  1313→                )}
+  1314→  1314→
+  1315→  1315→                {/* Loading State */}
+  1316→  1316→                {isSearching && (
+  1317→  1317→                  <div className="flex flex-col items-center justify-center py-16">
+  1318→  1318→                    <div className="w-16 h-16 rounded-2xl bg-orange-500/10 border border-orange-500/20 flex items-center justify-center mb-4">
+  1319→  1319→                      <Loader2 className="w-8 h-8 text-orange-400 animate-spin" />
+  1320→  1320→                    </div>
+  1321→  1321→                    <p className="text-sm text-slate-400 mb-2">Đang tìm kiếm...</p>
+  1322→  1322→                    <div className="flex items-center gap-4 text-xs text-slate-500">
+  1323→  1323→                      <span className="flex items-center gap-1"><Globe className="w-3 h-3" /> Tìm kiếm web</span>
+  1324→  1324→                      <span className="flex items-center gap-1"><BookOpen className="w-3 h-3" /> Đọc trang</span>
+  1325→  1325→                      <span className="flex items-center gap-1"><Brain className="w-3 h-3" /> AI tổng hợp</span>
+  1326→  1326→                    </div>
+  1327→  1327→                  </div>
+  1328→  1328→                )}
+  1329→  1329→
+  1330→  1330→                {/* Search Results */}
+  1331→  1331→                {searchResult && !isSearching && (
+  1332→  1332→                  <div className="space-y-4">
+  1333→  1333→                    {/* Sources Bar */}
+  1334→  1334→                    {searchResult.sources.length > 0 && (
+  1335→  1335→                      <div>
+  1336→  1336→                        <h3 className="text-xs text-slate-500 uppercase tracking-wider mb-2">Nguồn tham khảo</h3>
+  1337→  1337→                        <div className="flex gap-2 overflow-x-auto pb-2">
+  1338→  1338→                          {searchResult.sources.slice(0, 8).map((source) => (
+  1339→  1339→                            <a
+  1340→  1340→                              key={source.id}
+  1341→  1341→                              href={source.url}
+  1342→  1342→                              target="_blank"
+  1343→  1343→                              rel="noopener noreferrer"
+  1344→  1344→                              className="flex items-center gap-2 px-3 py-2 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 transition-all shrink-0 max-w-[200px]"
+  1345→  1345→                            >
+  1346→  1346→                              <div className="w-5 h-5 rounded bg-orange-500/20 flex items-center justify-center shrink-0">
+  1347→  1347→                                <span className="text-[9px] text-orange-400 font-bold">{source.id}</span>
+  1348→  1348→                              </div>
+  1349→  1349→                              <div className="min-w-0">
+  1350→  1350→                                <p className="text-[10px] text-slate-300 truncate">{source.name}</p>
+  1351→  1351→                                <p className="text-[9px] text-slate-600 truncate">{source.host_name || source.url}</p>
+  1352→  1352→                              </div>
+  1353→  1353→                            </a>
+  1354→  1354→                          ))}
+  1355→  1355→                        </div>
+  1356→  1356→                      </div>
+  1357→  1357→                    )}
+  1358→  1358→
+  1359→  1359→                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+  1360→  1360→                      {/* AI Answer Panel */}
+  1361→  1361→                      <div className={`${searchResult.places.length > 0 ? 'lg:col-span-2' : 'lg:col-span-3'}`}>
+  1362→  1362→                        <Card className="bg-black/30 border-white/10 backdrop-blur-sm">
+  1363→  1363→                          <CardHeader className="pb-3">
+  1364→  1364→                            <CardTitle className="text-sm font-medium flex items-center gap-2">
+  1365→  1365→                              <Sparkles className="w-4 h-4 text-orange-400" />
+  1366→  1366→                              Kết quả tìm kiếm
+  1367→  1367→                              <Badge variant="outline" className="text-[9px] px-1.5 py-0 ml-auto border-white/10 text-slate-400">
+  1368→  1368→                                {searchResult.sources.length} nguồn
+  1369→  1369→                              </Badge>
+  1370→  1370→                            </CardTitle>
+  1371→  1371→                          </CardHeader>
+  1372→  1372→                          <CardContent>
+  1373→  1373→                            <div className="prose prose-invert prose-sm max-w-none text-slate-200 leading-relaxed whitespace-pre-wrap">
+  1374→  1374→                              {searchResult.answer}
+  1375→  1375→                            </div>
+  1376→  1376→                          </CardContent>
+  1377→  1377→                        </Card>
+  1378→  1378→                      </div>
+  1379→  1379→
+  1380→  1380→                      {/* Map Panel - show when there are places */}
+  1381→  1381→                      {searchResult.places.length > 0 && (
+  1382→  1382→                        <div className="space-y-3">
+  1383→  1383→                          <Card className="bg-black/30 border-white/10 backdrop-blur-sm overflow-hidden">
+  1384→  1384→                            <div className="h-64">
+  1385→  1385→                              <MapComponent
+  1386→  1386→                                places={searchResult.places}
+  1387→  1387→                                selectedPlace={selectedSearchPlace}
+  1388→  1388→                                onPlaceSelect={(place) => setSelectedSearchPlace(place)}
+  1389→  1389→                              />
+  1390→  1390→                            </div>
+  1391→  1391→                          </Card>
+  1392→  1392→                          
+  1393→  1393→                          {/* Places List */}
+  1394→  1394→                          <Card className="bg-black/30 border-white/10 backdrop-blur-sm">
+  1395→  1395→                            <CardHeader className="pb-2">
+  1396→  1396→                              <CardTitle className="text-xs font-medium flex items-center gap-2">
+  1397→  1397→                                <MapPin className="w-3.5 h-3.5 text-orange-400" />
+  1398→  1398→                                Địa điểm ({searchResult.places.length})
+  1399→  1399→                              </CardTitle>
+  1400→  1400→                            </CardHeader>
+  1401→  1401→                            <CardContent>
+  1402→  1402→                              <ScrollArea className="max-h-64">
+  1403→  1403→                                <div className="space-y-2">
+  1404→  1404→                                  {searchResult.places.map((place) => (
+  1405→  1405→                                    <button
+  1406→  1406→                                      key={place.id}
+  1407→  1407→                                      onClick={() => setSelectedSearchPlace(place)}
+  1408→  1408→                                      className={`w-full text-left p-2.5 rounded-lg border transition-all ${
+  1409→  1409→                                        selectedSearchPlace?.id === place.id
+  1410→  1410→                                          ? 'border-orange-500/50 bg-orange-500/10'
+  1411→  1411→                                          : 'border-white/5 bg-white/5 hover:bg-white/10'
+  1412→  1412→                                      }`}
+  1413→  1413→                                    >
+  1414→  1414→                                      <div className="flex items-start gap-2">
+  1415→  1415→                                        <MapPin className="w-3.5 h-3.5 text-orange-400 mt-0.5 shrink-0" />
+  1416→  1416→                                        <div className="min-w-0">
+  1417→  1417→                                          <p className="text-xs font-medium text-slate-200 truncate">{place.name}</p>
+  1418→  1418→                                          <p className="text-[10px] text-slate-500 truncate">{place.fullAddress?.split(',').slice(0, 3).join(',')}</p>
+  1419→  1419→                                          <div className="flex items-center gap-2 mt-1">
+  1420→  1420→                                            {place.phone && (
+  1421→  1421→                                              <span className="flex items-center gap-0.5 text-[9px] text-slate-400">
+  1422→  1422→                                                <Phone className="w-2.5 h-2.5" />
+  1423→  1423→                                                {place.phone}
+  1424→  1424→                                              </span>
+  1425→  1425→                                            )}
+  1426→  1426→                                            {place.website && (
+  1427→  1427→                                              <a href={place.website} target="_blank" rel="noopener noreferrer" className="flex items-center gap-0.5 text-[9px] text-cyan-400 hover:text-cyan-300" onClick={(e) => e.stopPropagation()}>
+  1428→  1428→                                                <ExternalLink className="w-2.5 h-2.5" />
+  1429→  1429→                                                Website
+  1430→  1430→                                              </a>
+  1431→  1431→                                            )}
+  1432→  1432→                                          </div>
+  1433→  1433→                                        </div>
+  1434→  1434→                                      </div>
+  1435→  1435→                                    </button>
+  1436→  1436→                                  ))}
+  1437→  1437→                                </div>
+  1438→  1438→                              </ScrollArea>
+  1439→  1439→                            </CardContent>
+  1440→  1440→                          </Card>
+  1441→  1441→                        </div>
+  1442→  1442→                      )}
+  1443→  1443→                    </div>
+  1444→  1444→                  </div>
+  1445→  1445→                )}
+  1446→  1446→              </div>
+  1447→  1447→            </TabsContent>
+  1448→  1448→
+  1449→  1449→          </Tabs>
+  1450→  1450→        </main>
+  1451→  1451→
+  1452→  1452→        {/* Footer */}
+  1453→  1453→        <footer className="border-t border-white/10 bg-black/20 mt-auto">
+  1454→  1454→          <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex items-center justify-between">
+  1455→  1455→            <div className="flex items-center gap-4 text-xs text-slate-500">
+  1456→  1456→              <span className="flex items-center gap-1.5">
+  1457→  1457→                <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-emerald-400' : 'bg-red-400'}`} />
+  1458→  1458→                {isConnected ? 'Hermes Gateway kết nối' : 'Hermes Gateway ngắt kết nối'}
+  1459→  1459→              </span>
+  1460→  1460→              <span>·</span>
+  1461→  1461→              <span>Built with Next.js 16 + Vercel AI SDK</span>
+  1462→  1462→            </div>
+  1463→  1463→            <div className="text-xs text-slate-600">
+  1464→  1464→              Hermes Agent + Vercel AI SDK
+  1465→  1465→            </div>
+  1466→  1466→          </div>
+  1467→  1467→        </footer>
+  1468→  1468→      </div>
+  1469→  1469→    </TooltipProvider>
+  1470→  1470→  );
+  1471→  1471→}
+  1472→  1472→

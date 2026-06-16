@@ -1,0 +1,1472 @@
+     1→'use client';
+     2→
+     3→import { useChat } from '@ai-sdk/react';
+     4→import { useState, useEffect, useRef, useCallback } from 'react';
+     5→import { motion, AnimatePresence } from 'framer-motion';
+     6→import {
+     7→  MessageSquare, Zap, Brain, Server, Globe, Terminal,
+     8→  ChevronRight, Activity, Cpu, HardDrive, Wifi, WifiOff,
+     9→  Send, RotateCcw, Sparkles, Layers, Code2, Shield,
+    10→  Eye, Image, Mic, Search, Wrench, Bot, ArrowRight,
+    11→  CheckCircle2, XCircle, Clock, FolderOpen, FileText,
+    12→  LayoutDashboard, Settings, RefreshCw, ChevronDown,
+    13→  MapPin, ExternalLink, Phone, Building2, FileCheck,
+    14→  BookOpen, Lightbulb, Loader2
+    15→} from 'lucide-react';
+    16→import { Button } from '@/components/ui/button';
+    17→import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+    18→import { Badge } from '@/components/ui/badge';
+    19→import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+    20→import { ScrollArea } from '@/components/ui/scroll-area';
+    21→import { Separator } from '@/components/ui/separator';
+    22→import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+    23→import dynamic from 'next/dynamic';
+    24→
+    25→// Dynamic import for Leaflet map (no SSR)
+    26→const MapComponent = dynamic(() => import('@/components/MapComponent'), {
+    27→  ssr: false,
+    28→  loading: () => (
+    29→    <div className="w-full h-full min-h-[300px] rounded-xl bg-slate-800/50 flex items-center justify-center">
+    30→      <div className="text-slate-500 text-sm">Đang tải bản đồ...</div>
+    31→    </div>
+    32→  ),
+    33→});
+    34→
+    35→// Types
+    36→interface HermesStatus {
+    37→  connected: boolean;
+    38→  health: any;
+    39→  models: any;
+    40→  capabilities: any;
+    41→  skills: any;
+    42→  sessions: any;
+    43→  apiBaseUrl: string;
+    44→}
+    45→
+    46→interface Skill {
+    47→  name: string;
+    48→  description: string;
+    49→  category: string;
+    50→}
+    51→
+    52→interface Session {
+    53→  id: string;
+    54→  title: string;
+    55→  created_at: string;
+    56→  updated_at: string;
+    57→  message_count: number;
+    58→  status: string;
+    59→}
+    60→
+    61→interface Toolset {
+    62→  name: string;
+    63→  description: string;
+    64→  tools: string[];
+    65→}
+    66→
+    67→// Search types
+    68→interface SearchSource {
+    69→  id: number;
+    70→  url: string;
+    71→  name: string;
+    72→  snippet: string;
+    73→  host_name?: string;
+    74→  date?: string;
+    75→}
+    76→
+    77→interface SearchPlace {
+    78→  id: number | string;
+    79→  name: string;
+    80→  fullAddress: string;
+    81→  lat: number;
+    82→  lon: number;
+    83→  type?: string;
+    84→  category?: string;
+    85→  phone?: string | null;
+    86→  website?: string | null;
+    87→  openingHours?: string | null;
+    88→}
+    89→
+    90→interface SearchResult {
+    91→  answer: string;
+    92→  sources: SearchSource[];
+    93→  places: SearchPlace[];
+    94→  query: string;
+    95→}
+    96→
+    97→// Available models configuration
+    98→const AVAILABLE_MODELS = [
+    99→  {
+   100→    id: 'qwen3.5-flash',
+   101→    name: 'Qwen 3.5 Flash',
+   102→    provider: 'Alibaba Cloud (DashScope)',
+   103→    description: 'Model nhanh và mạnh mẽ từ Alibaba, hỗ trợ đa ngôn ngữ',
+   104→    icon: Cpu,
+   105→    color: 'from-orange-500 to-amber-500',
+   106→    bgColor: 'bg-orange-500/10 border-orange-500/30',
+   107→    textColor: 'text-orange-400',
+   108→    apiBaseUrl: 'https://ws-09yuoi7zzbynceax.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1',
+   109→  },
+   110→  {
+   111→    id: 'hermes-agent',
+   112→    name: 'Hermes Agent',
+   113→    provider: 'Nous Research (Local)',
+   114→    description: 'Agent tự trị có trí nhớ bền vững, chạy cục bộ',
+   115→    icon: Brain,
+   116→    color: 'from-violet-500 to-purple-500',
+   117→    bgColor: 'bg-violet-500/10 border-violet-500/30',
+   118→    textColor: 'text-violet-400',
+   119→    apiBaseUrl: 'http://127.0.0.1:8642/v1',
+   120→  },
+   121→];
+   122→
+   123→// Category icon mapping
+   124→const categoryIcons: Record<string, any> = {
+   125→  filesystem: FolderOpen,
+   126→  execution: Terminal,
+   127→  web: Globe,
+   128→  browser: Eye,
+   129→  media: Image,
+   130→  agent: Bot,
+   131→};
+   132→
+   133→const categoryColors: Record<string, string> = {
+   134→  filesystem: 'text-amber-500 bg-amber-500/10',
+   135→  execution: 'text-red-500 bg-red-500/10',
+   136→  web: 'text-cyan-500 bg-cyan-500/10',
+   137→  browser: 'text-purple-500 bg-purple-500/10',
+   138→  media: 'text-pink-500 bg-pink-500/10',
+   139→  agent: 'text-emerald-500 bg-emerald-500/10',
+   140→};
+   141→
+   142→// Architecture flow nodes
+   143→const archNodes = [
+   144→  { id: 'user', label: 'Người dùng', icon: MessageSquare, x: 50, y: 50, color: 'from-blue-500 to-blue-600' },
+   145→  { id: 'vercel', label: 'Vercel AI SDK', icon: Layers, x: 50, y: 180, color: 'from-cyan-500 to-cyan-600' },
+   146→  { id: 'nextjs', label: 'Next.js API', icon: Code2, x: 200, y: 180, color: 'from-emerald-500 to-emerald-600' },
+   147→  { id: 'hermes-api', label: 'Hermes API\n(:8642)', icon: Server, x: 200, y: 310, color: 'from-orange-500 to-orange-600' },
+   148→  { id: 'hermes-agent', label: 'Hermes Agent', icon: Brain, x: 50, y: 310, color: 'from-violet-500 to-violet-600' },
+   149→  { id: 'mcp', label: 'MCP Server', icon: Wrench, x: 50, y: 440, color: 'from-rose-500 to-rose-600' },
+   150→  { id: 'memory', label: 'Persistent\nMemory', icon: HardDrive, x: 200, y: 440, color: 'from-teal-500 to-teal-600' },
+   151→  { id: 'skills', label: 'Skills\nSystem', icon: Sparkles, x: 350, y: 310, color: 'from-amber-500 to-amber-600' },
+   152→];
+   153→
+   154→const archConnections = [
+   155→  { from: 'user', to: 'vercel', label: 'useChat' },
+   156→  { from: 'vercel', to: 'nextjs', label: 'streamText' },
+   157→  { from: 'nextjs', to: 'hermes-api', label: 'OpenAI API' },
+   158→  { from: 'hermes-api', to: 'hermes-agent', label: 'Agent Loop' },
+   159→  { from: 'hermes-agent', to: 'mcp', label: 'MCP Protocol' },
+   160→  { from: 'hermes-agent', to: 'memory', label: 'Read/Write' },
+   161→  { from: 'hermes-agent', to: 'skills', label: 'Create/Execute' },
+   162→];
+   163→
+   164→export default function Home() {
+   165→  const [hermesStatus, setHermesStatus] = useState<HermesStatus | null>(null);
+   166→  const [skills, setSkills] = useState<Skill[]>([]);
+   167→  const [sessions, setSessions] = useState<Session[]>([]);
+   168→  const [toolsets, setToolsets] = useState<Toolset[]>([]);
+   169→  const [activeTab, setActiveTab] = useState('chat');
+   170→  const [isLoadingStatus, setIsLoadingStatus] = useState(true);
+   171→  const [selectedSession, setSelectedSession] = useState<string | null>(null);
+   172→  const [selectedModel, setSelectedModel] = useState('qwen3.5-flash');
+   173→  const [showModelPicker, setShowModelPicker] = useState(false);
+   174→  const [searchQuery, setSearchQuery] = useState('');
+   175→  const [searchMode, setSearchMode] = useState<'smart' | 'places' | 'business'>('smart');
+   176→  const [searchResult, setSearchResult] = useState<SearchResult | null>(null);
+   177→  const [isSearching, setIsSearching] = useState(false);
+   178→  const [selectedSearchPlace, setSelectedSearchPlace] = useState<SearchPlace | null>(null);
+   179→  const [searchHistory, setSearchHistory] = useState<string[]>([]);
+   180→  const chatEndRef = useRef<HTMLDivElement>(null);
+   181→  const inputRef = useRef<HTMLTextAreaElement>(null);
+   182→
+   183→  const currentModel = AVAILABLE_MODELS.find(m => m.id === selectedModel) || AVAILABLE_MODELS[0];
+   184→
+   185→  const { messages, input, handleInputChange, handleSubmit, isLoading, reload, setMessages } = useChat({
+   186→    api: '/api/chat',
+   187→    initialMessages: [],
+   188→    body: { model: selectedModel },
+   189→    onError: (err) => {
+   190→      console.error('Chat error:', err);
+   191→    },
+   192→  });
+   193→
+   194→  // Fetch Hermes status
+   195→  const fetchStatus = useCallback(async () => {
+   196→    setIsLoadingStatus(true);
+   197→    try {
+   198→      const res = await fetch('/api/hermes/status');
+   199→      const data = await res.json();
+   200→      setHermesStatus(data);
+   201→    } catch {
+   202→      setHermesStatus({ connected: false, health: null, models: null, capabilities: null, skills: null, sessions: null, apiBaseUrl: 'http://127.0.0.1:8642' });
+   203→    }
+   204→    setIsLoadingStatus(false);
+   205→  }, []);
+   206→
+   207→  // Fetch skills, sessions, toolsets
+   208→  const fetchData = useCallback(async () => {
+   209→    try {
+   210→      const [skillsRes, sessionsRes, toolsetsRes] = await Promise.all([
+   211→        fetch('/api/hermes/skills'),
+   212→        fetch('/api/hermes/sessions'),
+   213→        fetch('/api/hermes/toolsets'),
+   214→      ]);
+   215→      const skillsData = await skillsRes.json();
+   216→      const sessionsData = await sessionsRes.json();
+   217→      const toolsetsData = await toolsetsRes.json();
+   218→      setSkills(skillsData.skills || []);
+   219→      setSessions(sessionsData.sessions || []);
+   220→      setToolsets(toolsetsData.toolsets || []);
+   221→    } catch (err) {
+   222→      console.error('Error fetching data:', err);
+   223→    }
+   224→  }, []);
+   225→
+   226→  useEffect(() => {
+   227→    fetchStatus();
+   228→    fetchData();
+   229→    const interval = setInterval(fetchStatus, 30000);
+   230→    return () => clearInterval(interval);
+   231→  }, [fetchStatus, fetchData]);
+   232→
+   233→  // Auto-scroll chat
+   234→  useEffect(() => {
+   235→    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+   236→  }, [messages]);
+   237→
+   238→  // Close model picker when clicking outside
+   239→  useEffect(() => {
+   240→    const handleClickOutside = (e: MouseEvent) => {
+   241→      if (showModelPicker) {
+   242→        const target = e.target as HTMLElement;
+   243→        if (!target.closest('[data-model-picker]')) {
+   244→          setShowModelPicker(false);
+   245→        }
+   246→      }
+   247→    };
+   248→    document.addEventListener('mousedown', handleClickOutside);
+   249→    return () => document.removeEventListener('mousedown', handleClickOutside);
+   250→  }, [showModelPicker]);
+   251→
+   252→  const isConnected = hermesStatus?.connected ?? false;
+   253→
+   254→  // Smart search handler
+   255→  const handleSearch = useCallback(async () => {
+   256→    if (!searchQuery.trim() || isSearching) return;
+   257→    
+   258→    setIsSearching(true);
+   259→    setSearchResult(null);
+   260→    setSelectedSearchPlace(null);
+   261→    setSearchHistory(prev => [searchQuery, ...prev.filter(q => q !== searchQuery)].slice(0, 10));
+   262→
+   263→    try {
+   264→      if (searchMode === 'business') {
+   265→        // Business search with places + web
+   266→        const res = await fetch('/api/search/business', {
+   267→          method: 'POST',
+   268→          headers: { 'Content-Type': 'application/json' },
+   269→          body: JSON.stringify({ query: searchQuery, location: '' }),
+   270→        });
+   271→        const data = await res.json();
+   272→        setSearchResult({
+   273→          answer: data.answer || 'Không tìm thấy thông tin doanh nghiệp.',
+   274→          sources: data.sources || [],
+   275→          places: data.places || [],
+   276→          query: searchQuery,
+   277→        });
+   278→      } else if (searchMode === 'places') {
+   279→        // Place search using Nominatim
+   280→        const res = await fetch(`/api/search/places?q=${encodeURIComponent(searchQuery)}`);
+   281→        const data = await res.json();
+   282→        setSearchResult({
+   283→          answer: `Tìm thấy ${data.places?.length || 0} địa điểm cho "${searchQuery}"`,
+   284→          sources: [],
+   285→          places: data.places || [],
+   286→          query: searchQuery,
+   287→        });
+   288→      } else {
+   289→        // Smart search (Perplexity-style)
+   290→        const res = await fetch('/api/search', {
+   291→          method: 'POST',
+   292→          headers: { 'Content-Type': 'application/json' },
+   293→          body: JSON.stringify({ query: searchQuery }),
+   294→        });
+   295→        const data = await res.json();
+   296→        setSearchResult({
+   297→          answer: data.answer || 'Không tìm thấy kết quả.',
+   298→          sources: data.sources || [],
+   299→          places: data.places || [],
+   300→          query: searchQuery,
+   301→        });
+   302→      }
+   303→    } catch (error) {
+   304→      console.error('Search error:', error);
+   305→      setSearchResult({
+   306→        answer: 'Đã xảy ra lỗi khi tìm kiếm. Vui lòng thử lại.',
+   307→        sources: [],
+   308→        places: [],
+   309→        query: searchQuery,
+   310→      });
+   311→    }
+   312→    setIsSearching(false);
+   313→  }, [searchQuery, searchMode, isSearching]);
+   314→
+   315→  // Group skills by category
+   316→  const skillsByCategory = skills.reduce<Record<string, Skill[]>>((acc, skill) => {
+   317→    const cat = skill.category || 'other';
+   318→    if (!acc[cat]) acc[cat] = [];
+   319→    acc[cat].push(skill);
+   320→    return acc;
+   321→  }, {});
+   322→
+   323→  return (
+   324→    <TooltipProvider>
+   325→      <div className="min-h-screen flex flex-col bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-white">
+   326→        {/* Header */}
+   327→        <header className="border-b border-white/10 backdrop-blur-xl bg-black/20">
+   328→          <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex items-center justify-between">
+   329→            <div className="flex items-center gap-3">
+   330→              <div className="relative">
+   331→                <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-500 to-cyan-500 flex items-center justify-center shadow-lg shadow-violet-500/20">
+   332→                  <Brain className="w-5 h-5 text-white" />
+   333→                </div>
+   334→                <div className="absolute -bottom-0.5 -right-0.5 w-3 h-3 rounded-full border-2 border-slate-900 bg-emerald-400 animate-pulse" />
+   335→              </div>
+   336→              <div>
+   337→                <h1 className="text-lg font-bold bg-gradient-to-r from-violet-400 to-cyan-400 bg-clip-text text-transparent">
+   338→                  Hermes + Vercel AI SDK
+   339→                </h1>
+   340→                <p className="text-xs text-slate-400">Autonomous Agent · Web Interface</p>
+   341→              </div>
+   342→            </div>
+   343→
+   344→            <div className="flex items-center gap-3">
+   345→              {/* Model Picker */}
+   346→              <div className="relative z-50" data-model-picker>
+   347→                <button
+   348→                  onClick={() => setShowModelPicker(!showModelPicker)}
+   349→                  className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs transition-all ${currentModel.bgColor} hover:opacity-80`}
+   350→                >
+   351→                  <currentModel.icon className="w-3.5 h-3.5" />
+   352→                  <span className={`font-medium ${currentModel.textColor}`}>{currentModel.name}</span>
+   353→                  <ChevronDown className={`w-3 h-3 ${currentModel.textColor} transition-transform ${showModelPicker ? 'rotate-180' : ''}`} />
+   354→                </button>
+   355→                
+   356→                <AnimatePresence>
+   357→                  {showModelPicker && (
+   358→                    <motion.div
+   359→                      initial={{ opacity: 0, y: -5, scale: 0.95 }}
+   360→                      animate={{ opacity: 1, y: 0, scale: 1 }}
+   361→                      exit={{ opacity: 0, y: -5, scale: 0.95 }}
+   362→                      transition={{ duration: 0.15 }}
+   363→                      className="absolute right-0 top-full mt-2 w-72 rounded-xl border border-white/10 bg-slate-900/95 backdrop-blur-xl shadow-2xl shadow-black/40 z-50 overflow-hidden"
+   364→                    >
+   365→                      <div className="p-2 border-b border-white/5">
+   366→                        <p className="text-[10px] text-slate-500 uppercase tracking-wider px-2">Chọn Model</p>
+   367→                      </div>
+   368→                      <div className="p-1.5">
+   369→                        {AVAILABLE_MODELS.map((model) => {
+   370→                          const ModelIcon = model.icon;
+   371→                          const isSelected = model.id === selectedModel;
+   372→                          return (
+   373→                            <button
+   374→                              key={model.id}
+   375→                              onClick={() => {
+   376→                                setSelectedModel(model.id);
+   377→                                setShowModelPicker(false);
+   378→                              }}
+   379→                              className={`w-full flex items-start gap-3 p-2.5 rounded-lg transition-all text-left ${
+   380→                                isSelected
+   381→                                  ? model.bgColor
+   382→                                  : 'hover:bg-white/5'
+   383→                              }`}
+   384→                            >
+   385→                              <div className={`w-8 h-8 rounded-lg bg-gradient-to-br ${model.color} flex items-center justify-center shrink-0 mt-0.5`}>
+   386→                                <ModelIcon className="w-4 h-4 text-white" />
+   387→                              </div>
+   388→                              <div className="flex-1 min-w-0">
+   389→                                <div className="flex items-center gap-2">
+   390→                                  <span className="text-sm font-medium text-white">{model.name}</span>
+   391→                                  {isSelected && (
+   392→                                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+   393→                                  )}
+   394→                                </div>
+   395→                                <span className="text-[10px] text-slate-500">{model.provider}</span>
+   396→                                <p className="text-[10px] text-slate-400 mt-0.5">{model.description}</p>
+   397→                              </div>
+   398→                            </button>
+   399→                          );
+   400→                        })}
+   401→                      </div>
+   402→                    </motion.div>
+   403→                  )}
+   404→                </AnimatePresence>
+   405→              </div>
+   406→
+   407→              {/* Connection status - Hermes */}
+   408→              <motion.div
+   409→                initial={{ opacity: 0, scale: 0.9 }}
+   410→                animate={{ opacity: 1, scale: 1 }}
+   411→                className="flex items-center gap-2"
+   412→              >
+   413→                <Badge
+   414→                  variant="outline"
+   415→                  className={`gap-1.5 text-xs px-3 py-1 ${
+   416→                    isConnected
+   417→                      ? 'border-emerald-500/50 text-emerald-400 bg-emerald-500/10'
+   418→                      : 'border-red-500/50 text-red-400 bg-red-500/10'
+   419→                  }`}
+   420→                >
+   421→                  {isConnected ? (
+   422→                    <Wifi className="w-3 h-3" />
+   423→                  ) : (
+   424→                    <WifiOff className="w-3 h-3" />
+   425→                  )}
+   426→                  {isConnected ? 'Hermes Online' : 'Hermes Offline'}
+   427→                </Badge>
+   428→              </motion.div>
+   429→
+   430→              <Tooltip>
+   431→                <TooltipTrigger asChild>
+   432→                  <Button
+   433→                    variant="ghost"
+   434→                    size="icon"
+   435→                    className="h-8 w-8 text-slate-400 hover:text-white"
+   436→                    onClick={() => { fetchStatus(); fetchData(); }}
+   437→                  >
+   438→                    <RefreshCw className={`w-4 h-4 ${isLoadingStatus ? 'animate-spin' : ''}`} />
+   439→                  </Button>
+   440→                </TooltipTrigger>
+   441→                <TooltipContent>Làm mới trạng thái</TooltipContent>
+   442→              </Tooltip>
+   443→            </div>
+   444→          </div>
+   445→        </header>
+   446→
+   447→        {/* Main Content */}
+   448→        <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-4">
+   449→          <Tabs value={activeTab} onValueChange={setActiveTab} className="h-full flex flex-col">
+   450→            <TabsList className="bg-white/5 border border-white/10 w-fit mb-4">
+   451→              <TabsTrigger value="chat" className="gap-1.5 data-[state=active]:bg-violet-500/20 data-[state=active]:text-violet-300">
+   452→                <MessageSquare className="w-3.5 h-3.5" />
+   453→                Chat
+   454→              </TabsTrigger>
+   455→              <TabsTrigger value="skills" className="gap-1.5 data-[state=active]:bg-violet-500/20 data-[state=active]:text-violet-300">
+   456→                <Zap className="w-3.5 h-3.5" />
+   457→                Skills
+   458→              </TabsTrigger>
+   459→              <TabsTrigger value="architecture" className="gap-1.5 data-[state=active]:bg-violet-500/20 data-[state=active]:text-violet-300">
+   460→                <Layers className="w-3.5 h-3.5" />
+   461→                Kiến trúc
+   462→              </TabsTrigger>
+   463→              <TabsTrigger value="sessions" className="gap-1.5 data-[state=active]:bg-violet-500/20 data-[state=active]:text-violet-300">
+   464→                <Clock className="w-3.5 h-3.5" />
+   465→                Sessions
+   466→              </TabsTrigger>
+   467→              <TabsTrigger value="search" className="gap-1.5 data-[state=active]:bg-orange-500/20 data-[state=active]:text-orange-300">
+   468→                <Search className="w-3.5 h-3.5" />
+   469→                Tìm kiếm
+   470→              </TabsTrigger>
+   471→            </TabsList>
+   472→
+   473→            {/* Chat Tab */}
+   474→            <TabsContent value="chat" className="flex-1 mt-0">
+   475→              <div className="grid grid-cols-1 lg:grid-cols-4 gap-4 h-[calc(100vh-180px)]">
+   476→                {/* Chat Panel - Main */}
+   477→                <div className="lg:col-span-3 flex flex-col rounded-2xl border border-white/10 bg-black/30 backdrop-blur-sm overflow-hidden">
+   478→                  {/* Chat Messages */}
+   479→                  <ScrollArea className="flex-1 p-4">
+   480→                    {messages.length === 0 ? (
+   481→                      <div className="flex flex-col items-center justify-center h-full min-h-[400px] text-center">
+   482→                        <motion.div
+   483→                          initial={{ opacity: 0, y: 20 }}
+   484→                          animate={{ opacity: 1, y: 0 }}
+   485→                          transition={{ delay: 0.1 }}
+   486→                        >
+   487→                          <div className="w-20 h-20 rounded-2xl bg-gradient-to-br from-violet-500/20 to-cyan-500/20 border border-white/10 flex items-center justify-center mx-auto mb-6">
+   488→                            <Sparkles className="w-10 h-10 text-violet-400" />
+   489→                          </div>
+   490→                          <h2 className="text-2xl font-bold mb-2 bg-gradient-to-r from-violet-400 to-cyan-400 bg-clip-text text-transparent">
+   491→                            Hermes Agent Dashboard
+   492→                          </h2>
+   493→                          <p className="text-slate-400 max-w-md mb-8">
+   494→                            Kết nối Vercel AI SDK với Hermes Agent — giao diện web hiện đại cho agent tự trị có trí nhớ bền vững
+   495→                          </p>
+   496→                          
+   497→                          {/* Quick Actions */}
+   498→                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-w-lg mx-auto">
+   499→                            {[
+   500→                              { icon: Search, text: 'Tìm kiếm thông tin trên web', prompt: 'Tìm kiếm thông tin về xu hướng AI năm 2026' },
+   501→                              { icon: Code2, text: 'Phân tích và viết code', prompt: 'Giúp tôi viết một API endpoint bằng Next.js' },
+   502→                              { icon: Brain, text: 'Phân tích dữ liệu', prompt: 'Phân tích dữ liệu và đưa ra nhận định' },
+   503→                              { icon: FileText, text: 'Tạo tài liệu', prompt: 'Tạo tài liệu kỹ thuật cho dự án' },
+   504→                            ].map((action, i) => (
+   505→                              <motion.button
+   506→                                key={i}
+   507→                                initial={{ opacity: 0, y: 10 }}
+   508→                                animate={{ opacity: 1, y: 0 }}
+   509→                                transition={{ delay: 0.2 + i * 0.1 }}
+   510→                                onClick={() => {
+   511→                                  handleInputChange({ target: { value: action.prompt } } as any);
+   512→                                  setTimeout(() => {
+   513→                                    const form = document.querySelector('form');
+   514→                                    if (form) form.requestSubmit();
+   515→                                  }, 100);
+   516→                                }}
+   517→                                className="flex items-center gap-3 p-3 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 transition-all text-left group"
+   518→                              >
+   519→                                <div className="w-9 h-9 rounded-lg bg-violet-500/10 flex items-center justify-center shrink-0 group-hover:bg-violet-500/20 transition-colors">
+   520→                                  <action.icon className="w-4 h-4 text-violet-400" />
+   521→                                </div>
+   522→                                <span className="text-sm text-slate-300 group-hover:text-white transition-colors">{action.text}</span>
+   523→                              </motion.button>
+   524→                            ))}
+   525→                          </div>
+   526→                        </motion.div>
+   527→                      </div>
+   528→                    ) : (
+   529→                      <div className="space-y-4 pb-4">
+   530→                        {messages.map((message, i) => (
+   531→                          <motion.div
+   532→                            key={message.id}
+   533→                            initial={{ opacity: 0, y: 10 }}
+   534→                            animate={{ opacity: 1, y: 0 }}
+   535→                            transition={{ delay: i * 0.05 }}
+   536→                            className={`flex gap-3 ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
+   537→                          >
+   538→                            {message.role === 'assistant' && (
+   539→                              <div className={`w-8 h-8 rounded-lg bg-gradient-to-br ${currentModel.color} flex items-center justify-center shrink-0 mt-1`}>
+   540→                                <currentModel.icon className="w-4 h-4 text-white" />
+   541→                              </div>
+   542→                            )}
+   543→                            <div
+   544→                              className={`max-w-[80%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${
+   545→                                message.role === 'user'
+   546→                                  ? 'bg-violet-500/20 border border-violet-500/30 text-white'
+   547→                                  : 'bg-white/5 border border-white/10 text-slate-200'
+   548→                              }`}
+   549→                            >
+   550→                              <div className="whitespace-pre-wrap">{message.content}</div>
+   551→                            </div>
+   552→                            {message.role === 'user' && (
+   553→                              <div className="w-8 h-8 rounded-lg bg-slate-700 flex items-center justify-center shrink-0 mt-1">
+   554→                                <MessageSquare className="w-4 h-4 text-slate-300" />
+   555→                              </div>
+   556→                            )}
+   557→                          </motion.div>
+   558→                        ))}
+   559→                        {isLoading && (
+   560→                          <div className="flex gap-3">
+   561→                            <div className={`w-8 h-8 rounded-lg bg-gradient-to-br ${currentModel.color} flex items-center justify-center shrink-0`}>
+   562→                              <currentModel.icon className="w-4 h-4 text-white animate-pulse" />
+   563→                            </div>
+   564→                            <div className="bg-white/5 border border-white/10 rounded-2xl px-4 py-3">
+   565→                              <div className="flex gap-1.5">
+   566→                                <span className="w-2 h-2 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '0ms' }} />
+   567→                                <span className="w-2 h-2 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '150ms' }} />
+   568→                                <span className="w-2 h-2 rounded-full bg-violet-400 animate-bounce" style={{ animationDelay: '300ms' }} />
+   569→                              </div>
+   570→                            </div>
+   571→                          </div>
+   572→                        )}
+   573→                        <div ref={chatEndRef} />
+   574→                      </div>
+   575→                    )}
+   576→                  </ScrollArea>
+   577→
+   578→                  {/* Chat Input */}
+   579→                  <div className="border-t border-white/10 p-4 bg-black/20">
+   580→                    <form onSubmit={handleSubmit} className="flex gap-3 items-end">
+   581→                      <div className="flex-1 relative">
+   582→                        <textarea
+   583→                          ref={inputRef as any}
+   584→                          value={input}
+   585→                          onChange={handleInputChange}
+   586→                          onKeyDown={(e) => {
+   587→                            if (e.key === 'Enter' && !e.shiftKey) {
+   588→                              e.preventDefault();
+   589→                              handleSubmit(e as any);
+   590→                            }
+   591→                          }}
+   592→                          placeholder={selectedModel === 'hermes-agent' 
+   593→                            ? (isConnected ? 'Nhập tin nhắn cho Hermes Agent...' : 'Hermes Agent đang offline — nhắn tin sẽ không được xử lý')
+   594→                            : 'Nhập tin nhắn cho Qwen 3.5 Flash...'
+   595→                          }
+   596→                          className="w-full rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-violet-500/50 focus:border-violet-500/50 resize-none min-h-[44px] max-h-32"
+   597→                          rows={1}
+   598→                          disabled={isLoading}
+   599→                        />
+   600→                      </div>
+   601→                      <div className="flex gap-2">
+   602→                        {messages.length > 0 && (
+   603→                          <Tooltip>
+   604→                            <TooltipTrigger asChild>
+   605→                              <Button
+   606→                                type="button"
+   607→                                variant="ghost"
+   608→                                size="icon"
+   609→                                className="h-11 w-11 text-slate-400 hover:text-white rounded-xl"
+   610→                                onClick={() => reload()}
+   611→                                disabled={isLoading}
+   612→                              >
+   613→                                <RotateCcw className="w-4 h-4" />
+   614→                              </Button>
+   615→                            </TooltipTrigger>
+   616→                            <TooltipContent>Gửi lại tin nhắn cuối</TooltipContent>
+   617→                          </Tooltip>
+   618→                        )}
+   619→                        <Button
+   620→                          type="submit"
+   621→                          disabled={isLoading || !input?.trim()}
+   622→                          className="h-11 px-5 rounded-xl bg-gradient-to-r from-violet-500 to-cyan-500 hover:from-violet-600 hover:to-cyan-600 text-white shadow-lg shadow-violet-500/20 transition-all"
+   623→                        >
+   624→                          <Send className="w-4 h-4" />
+   625→                        </Button>
+   626→                      </div>
+   627→                    </form>
+   628→                    <div className="flex items-center gap-3 mt-2 text-xs text-slate-500">
+   629→                      <span className={`flex items-center gap-1 ${currentModel.textColor}`}>
+   630→                        <currentModel.icon className="w-3 h-3" />
+   631→                        {currentModel.name}
+   632→                      </span>
+   633→                      <span>·</span>
+   634→                      <span>API: <span className="text-slate-400">{currentModel.apiBaseUrl}</span></span>
+   635→                      <span>·</span>
+   636→                      <span>Protocol: <span className="text-slate-400">OpenAI-compatible</span></span>
+   637→                    </div>
+   638→                  </div>
+   639→                </div>
+   640→
+   641→                {/* Right Sidebar - Quick Info */}
+   642→                <div className="hidden lg:flex flex-col gap-4">
+   643→                  {/* Connection Status Card */}
+   644→                  <Card className="bg-black/30 border-white/10 backdrop-blur-sm">
+   645→                    <CardHeader className="pb-3">
+   646→                      <CardTitle className="text-sm font-medium text-slate-300 flex items-center gap-2">
+   647→                        <Activity className="w-4 h-4 text-emerald-400" />
+   648→                        Trạng thái kết nối
+   649→                      </CardTitle>
+   650→                    </CardHeader>
+   651→                    <CardContent className="space-y-3">
+   652→                      <div className="flex items-center justify-between">
+   653→                        <span className="text-xs text-slate-400">Model hiện tại</span>
+   654→                        <Badge variant="outline" className={`text-[10px] px-2 py-0 ${currentModel.bgColor} ${currentModel.textColor}`}>
+   655→                          {currentModel.name}
+   656→                        </Badge>
+   657→                      </div>
+   658→                      <div className="flex items-center justify-between">
+   659→                        <span className="text-xs text-slate-400">Provider</span>
+   660→                        <span className="text-[10px] text-slate-300">{currentModel.provider}</span>
+   661→                      </div>
+   662→                      <div className="flex items-center justify-between">
+   663→                        <span className="text-xs text-slate-400">Hermes Gateway</span>
+   664→                        <Badge variant="outline" className={`text-[10px] px-2 py-0 ${isConnected ? 'border-emerald-500/50 text-emerald-400' : 'border-red-500/50 text-red-400'}`}>
+   665→                          {isConnected ? 'Online' : 'Offline'}
+   666→                        </Badge>
+   667→                      </div>
+   668→                      <div className="flex items-center justify-between">
+   669→                        <span className="text-xs text-slate-400">Protocol</span>
+   670→                        <span className="text-xs text-slate-300">OpenAI API</span>
+   671→                      </div>
+   672→                      <div className="flex items-center justify-between">
+   673→                        <span className="text-xs text-slate-400">Sessions</span>
+   674→                        <span className="text-xs text-slate-300">{sessions.length}</span>
+   675→                      </div>
+   676→                      <div className="flex items-center justify-between">
+   677→                        <span className="text-xs text-slate-400">Skills</span>
+   678→                        <span className="text-xs text-slate-300">{skills.length}</span>
+   679→                      </div>
+   680→                    </CardContent>
+   681→                  </Card>
+   682→
+   683→                  {/* Integration Models */}
+   684→                  <Card className="bg-black/30 border-white/10 backdrop-blur-sm">
+   685→                    <CardHeader className="pb-3">
+   686→                      <CardTitle className="text-sm font-medium text-slate-300 flex items-center gap-2">
+   687→                        <Shield className="w-4 h-4 text-violet-400" />
+   688→                        Mô hình kết nối
+   689→                      </CardTitle>
+   690→                    </CardHeader>
+   691→                    <CardContent className="space-y-3">
+   692→                      <div className="p-2.5 rounded-lg bg-violet-500/10 border border-violet-500/20">
+   693→                        <div className="flex items-center gap-2 mb-1">
+   694→                          <Server className="w-3.5 h-3.5 text-violet-400" />
+   695→                          <span className="text-xs font-medium text-violet-300">Model Provider</span>
+   696→                        </div>
+   697→                        <p className="text-[10px] text-slate-400 leading-relaxed">
+   698→                          Hermes làm endpoint LLM, Vercel AI SDK gọi như OpenAI API
+   699→                        </p>
+   700→                      </div>
+   701→                      <div className="p-2.5 rounded-lg bg-cyan-500/10 border border-cyan-500/20">
+   702→                        <div className="flex items-center gap-2 mb-1">
+   703→                          <Wrench className="w-3.5 h-3.5 text-cyan-400" />
+   704→                          <span className="text-xs font-medium text-cyan-300">Tool Executor (MCP)</span>
+   705→                        </div>
+   706→                        <p className="text-[10px] text-slate-400 leading-relaxed">
+   707→                          Web UI gọi skill/tool của Hermes qua MCP protocol
+   708→                        </p>
+   709→                      </div>
+   710→                    </CardContent>
+   711→                  </Card>
+   712→
+   713→                  {/* Recent Sessions */}
+   714→                  <Card className="bg-black/30 border-white/10 backdrop-blur-sm flex-1">
+   715→                    <CardHeader className="pb-3">
+   716→                      <CardTitle className="text-sm font-medium text-slate-300 flex items-center gap-2">
+   717→                        <Clock className="w-4 h-4 text-amber-400" />
+   718→                        Phiên gần đây
+   719→                      </CardTitle>
+   720→                    </CardHeader>
+   721→                    <CardContent>
+   722→                      <ScrollArea className="max-h-48">
+   723→                        <div className="space-y-2">
+   724→                          {sessions.slice(0, 5).map((session) => (
+   725→                            <button
+   726→                              key={session.id}
+   727→                              onClick={() => setSelectedSession(session.id)}
+   728→                              className={`w-full text-left p-2 rounded-lg border transition-all text-xs ${
+   729→                                selectedSession === session.id
+   730→                                  ? 'border-violet-500/50 bg-violet-500/10'
+   731→                                  : 'border-white/5 bg-white/5 hover:bg-white/10'
+   732→                              }`}
+   733→                            >
+   734→                              <div className="font-medium text-slate-300 truncate">{session.title}</div>
+   735→                              <div className="flex items-center gap-2 mt-1 text-slate-500">
+   736→                                <span>{session.message_count} tin nhắn</span>
+   737→                                <span>·</span>
+   738→                                <Badge variant="outline" className={`text-[9px] px-1.5 py-0 ${
+   739→                                  session.status === 'active' ? 'border-emerald-500/50 text-emerald-400' : 'border-slate-500/50 text-slate-400'
+   740→                                }`}>
+   741→                                  {session.status}
+   742→                                </Badge>
+   743→                              </div>
+   744→                            </button>
+   745→                          ))}
+   746→                        </div>
+   747→                      </ScrollArea>
+   748→                    </CardContent>
+   749→                  </Card>
+   750→                </div>
+   751→              </div>
+   752→            </TabsContent>
+   753→
+   754→            {/* Skills Tab */}
+   755→            <TabsContent value="skills" className="mt-0">
+   756→              <div className="space-y-4">
+   757→                <div className="flex items-center justify-between">
+   758→                  <div>
+   759→                    <h2 className="text-xl font-bold">Hermes Skills & Tools</h2>
+   760→                    <p className="text-sm text-slate-400 mt-1">Các kỹ năng và công cụ mà Hermes Agent sở hữu, có thể gọi từ giao diện web</p>
+   761→                  </div>
+   762→                  <Badge variant="outline" className="border-violet-500/50 text-violet-400 px-3">
+   763→                    {skills.length} Skills
+   764→                  </Badge>
+   765→                </div>
+   766→
+   767→                {/* Toolsets */}
+   768→                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+   769→                  {toolsets.map((toolset) => (
+   770→                    <motion.div
+   771→                      key={toolset.name}
+   772→                      initial={{ opacity: 0, y: 10 }}
+   773→                      animate={{ opacity: 1, y: 0 }}
+   774→                    >
+   775→                      <Card className="bg-black/30 border-white/10 backdrop-blur-sm h-full hover:border-violet-500/30 transition-colors">
+   776→                        <CardContent className="p-4">
+   777→                          <div className="flex items-center gap-2 mb-2">
+   778→                            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-violet-500/20 to-cyan-500/20 flex items-center justify-center">
+   779→                              <Wrench className="w-4 h-4 text-violet-400" />
+   780→                            </div>
+   781→                            <div>
+   782→                              <h3 className="text-sm font-medium text-white">{toolset.name}</h3>
+   783→                              <p className="text-[10px] text-slate-500">{toolset.tools.length} tools</p>
+   784→                            </div>
+   785→                          </div>
+   786→                          <p className="text-xs text-slate-400 mb-3">{toolset.description}</p>
+   787→                          <div className="flex flex-wrap gap-1">
+   788→                            {toolset.tools.slice(0, 4).map((tool) => (
+   789→                              <Badge key={tool} variant="outline" className="text-[9px] px-1.5 py-0 border-white/10 text-slate-400">
+   790→                                {tool}
+   791→                              </Badge>
+   792→                            ))}
+   793→                            {toolset.tools.length > 4 && (
+   794→                              <Badge variant="outline" className="text-[9px] px-1.5 py-0 border-white/10 text-slate-500">
+   795→                                +{toolset.tools.length - 4}
+   796→                              </Badge>
+   797→                            )}
+   798→                          </div>
+   799→                        </CardContent>
+   800→                      </Card>
+   801→                    </motion.div>
+   802→                  ))}
+   803→                </div>
+   804→
+   805→                {/* Skills by Category */}
+   806→                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+   807→                  {Object.entries(skillsByCategory).map(([category, catSkills]) => {
+   808→                    const Icon = categoryIcons[category] || Wrench;
+   809→                    const colorClass = categoryColors[category] || 'text-slate-500 bg-slate-500/10';
+   810→                    return (
+   811→                      <motion.div
+   812→                        key={category}
+   813→                        initial={{ opacity: 0, y: 10 }}
+   814→                        animate={{ opacity: 1, y: 0 }}
+   815→                      >
+   816→                        <Card className="bg-black/30 border-white/10 backdrop-blur-sm h-full">
+   817→                          <CardHeader className="pb-3">
+   818→                            <CardTitle className="text-sm font-medium flex items-center gap-2">
+   819→                              <div className={`w-7 h-7 rounded-lg flex items-center justify-center ${colorClass}`}>
+   820→                                <Icon className="w-3.5 h-3.5" />
+   821→                              </div>
+   822→                              <span className="capitalize text-slate-200">{category}</span>
+   823→                              <Badge variant="outline" className="text-[10px] px-1.5 py-0 ml-auto border-white/10 text-slate-400">
+   824→                                {catSkills.length}
+   825→                              </Badge>
+   826→                            </CardTitle>
+   827→                          </CardHeader>
+   828→                          <CardContent>
+   829→                            <div className="space-y-2">
+   830→                              {catSkills.map((skill) => (
+   831→                                <div key={skill.name} className="flex items-start gap-2 p-2 rounded-lg bg-white/5 hover:bg-white/10 transition-colors">
+   832→                                  <ChevronRight className="w-3 h-3 text-violet-400 mt-0.5 shrink-0" />
+   833→                                  <div>
+   834→                                    <div className="text-xs font-medium text-slate-300">{skill.name}</div>
+   835→                                    <div className="text-[10px] text-slate-500">{skill.description}</div>
+   836→                                  </div>
+   837→                                </div>
+   838→                              ))}
+   839→                            </div>
+   840→                          </CardContent>
+   841→                        </Card>
+   842→                      </motion.div>
+   843→                    );
+   844→                  })}
+   845→                </div>
+   846→              </div>
+   847→            </TabsContent>
+   848→
+   849→            {/* Architecture Tab */}
+   850→            <TabsContent value="architecture" className="mt-0">
+   851→              <div className="space-y-6">
+   852→                <div>
+   853→                  <h2 className="text-xl font-bold">Kiến trúc Kết hợp</h2>
+   854→                  <p className="text-sm text-slate-400 mt-1">Vercel AI SDK là "cơ thể" giao diện web, Hermes Agent là "bộ não" tự trị</p>
+   855→                </div>
+   856→
+   857→                {/* Architecture Diagram */}
+   858→                <div className="rounded-2xl border border-white/10 bg-black/30 backdrop-blur-sm p-6 overflow-x-auto">
+   859→                  <div className="min-w-[500px]">
+   860→                    <svg width="100%" viewBox="0 0 500 520" className="mx-auto">
+   861→                      {/* Connections */}
+   862→                      {archConnections.map((conn, i) => {
+   863→                        const from = archNodes.find(n => n.id === conn.from)!;
+   864→                        const to = archNodes.find(n => n.id === conn.to)!;
+   865→                        const x1 = from.x + 60;
+   866→                        const y1 = from.y + 25;
+   867→                        const x2 = to.x + 60;
+   868→                        const y2 = to.y + 25;
+   869→                        
+   870→                        return (
+   871→                          <g key={i}>
+   872→                            <line
+   873→                              x1={x1} y1={y1} x2={x2} y2={y2}
+   874→                              stroke="rgba(139,92,246,0.3)"
+   875→                              strokeWidth="2"
+   876→                              strokeDasharray="6,4"
+   877→                            />
+   878→                            <text
+   879→                              x={(x1 + x2) / 2}
+   880→                              y={(y1 + y2) / 2 - 8}
+   881→                              textAnchor="middle"
+   882→                              fill="rgba(148,163,184,0.7)"
+   883→                              fontSize="10"
+   884→                            >
+   885→                              {conn.label}
+   886→                            </text>
+   887→                          </g>
+   888→                        );
+   889→                      })}
+   890→
+   891→                      {/* Nodes */}
+   892→                      {archNodes.map((node) => {
+   893→                        const Icon = node.icon;
+   894→                        return (
+   895→                          <g key={node.id}>
+   896→                            <rect
+   897→                              x={node.x}
+   898→                              y={node.y}
+   899→                              width="120"
+   900→                              height="50"
+   901→                              rx="12"
+   902→                              fill="rgba(15,23,42,0.8)"
+   903→                              stroke="rgba(255,255,255,0.1)"
+   904→                              strokeWidth="1"
+   905→                            />
+   906→                            <defs>
+   907→                              <linearGradient id={`grad-${node.id}`} x1="0%" y1="0%" x2="100%" y2="100%">
+   908→                                <stop offset="0%" stopColor={node.color.includes('violet') ? '#8b5cf6' : node.color.includes('cyan') ? '#06b6d4' : node.color.includes('emerald') ? '#10b981' : node.color.includes('orange') ? '#f97316' : node.color.includes('rose') ? '#f43f5e' : node.color.includes('teal') ? '#14b8a6' : node.color.includes('amber') ? '#f59e0b' : node.color.includes('blue') ? '#3b82f6' : '#8b5cf6'} />
+   909→                                <stop offset="100%" stopColor={node.color.includes('violet') ? '#7c3aed' : node.color.includes('cyan') ? '#0891b2' : node.color.includes('emerald') ? '#059669' : node.color.includes('orange') ? '#ea580c' : node.color.includes('rose') ? '#e11d48' : node.color.includes('teal') ? '#0d9488' : node.color.includes('amber') ? '#d97706' : node.color.includes('blue') ? '#2563eb' : '#7c3aed'} />
+   910→                              </linearGradient>
+   911→                            </defs>
+   912→                            <rect
+   913→                              x={node.x}
+   914→                              y={node.y}
+   915→                              width="120"
+   916→                              height="50"
+   917→                              rx="12"
+   918→                              fill={`url(#grad-${node.id})`}
+   919→                              opacity="0.15"
+   920→                            />
+   921→                            {/* Icon placeholder */}
+   922→                            <foreignObject x={node.x + 10} y={node.y + 12} width="26" height="26">
+   923→                              <div className="flex items-center justify-center w-full h-full">
+   924→                                <Icon className="w-5 h-5 text-white opacity-80" />
+   925→                              </div>
+   926→                            </foreignObject>
+   927→                            <text
+   928→                              x={node.x + 42}
+   929→                              y={node.y + (node.label.includes('\n') ? 22 : 30)}
+   930→                              fill="white"
+   931→                              fontSize="11"
+   932→                              fontWeight="500"
+   933→                            >
+   934→                              {node.label.split('\n')[0]}
+   935→                            </text>
+   936→                            {node.label.includes('\n') && (
+   937→                              <text
+   938→                                x={node.x + 42}
+   939→                                y={node.y + 36}
+   940→                                fill="rgba(148,163,184,0.8)"
+   941→                                fontSize="10"
+   942→                              >
+   943→                                {node.label.split('\n')[1]}
+   944→                              </text>
+   945→                            )}
+   946→                          </g>
+   947→                        );
+   948→                      })}
+   949→                    </svg>
+   950→                  </div>
+   951→                </div>
+   952→
+   953→                {/* Two Connection Models */}
+   954→                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+   955→                  {/* Model 1: Model Provider */}
+   956→                  <motion.div
+   957→                    initial={{ opacity: 0, x: -20 }}
+   958→                    animate={{ opacity: 1, x: 0 }}
+   959→                  >
+   960→                    <Card className="bg-black/30 border-violet-500/20 backdrop-blur-sm h-full">
+   961→                      <CardHeader>
+   962→                        <div className="flex items-center gap-3">
+   963→                          <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-500 to-violet-600 flex items-center justify-center">
+   964→                            <Server className="w-5 h-5 text-white" />
+   965→                          </div>
+   966→                          <div>
+   967→                            <CardTitle className="text-base">Mô hình 1: Model Provider</CardTitle>
+   968→                            <p className="text-xs text-slate-400 mt-0.5">Hermes là endpoint LLM cho Vercel AI SDK</p>
+   969→                          </div>
+   970→                        </div>
+   971→                      </CardHeader>
+   972→                      <CardContent className="space-y-4">
+   973→                        <div className="p-3 rounded-xl bg-slate-800/50 border border-white/5 font-mono text-xs text-slate-300 leading-relaxed">
+   974→                          <span className="text-violet-400">import</span> {'{ createOpenAI }'} <span className="text-violet-400">from</span> <span className="text-emerald-400">&apos;@ai-sdk/openai&apos;</span>;{'\n'}
+   975→                          <span className="text-violet-400">import</span> {'{ streamText }'} <span className="text-violet-400">from</span> <span className="text-emerald-400">&apos;ai&apos;</span>;{'\n\n'}
+   976→                          <span className="text-violet-400">const</span> <span className="text-cyan-400">hermes</span> = <span className="text-amber-400">createOpenAI</span>({'{'}
+   977→                          {'\n'}  baseURL: <span className="text-emerald-400">&apos;http://localhost:8642/v1&apos;</span>,
+   978→                          {'\n'}  apiKey: <span className="text-emerald-400">&apos;hermes-local&apos;</span>
+   979→                          {'\n'}{'}'});{'\n\n'}
+   980→                          <span className="text-violet-400">const</span> result = <span className="text-amber-400">streamText</span>({'{'}
+   981→                          {'\n'}  model: hermes(<span className="text-emerald-400">&apos;hermes-agent&apos;</span>),
+   982→                          {'\n'}  messages,
+   983→                          {'\n'}  headers: {'{'}
+   984→                          {'\n'}    <span className="text-emerald-400">&apos;X-Hermes-Session-Id&apos;</span>: sessionId
+   985→                          {'\n'}  {'}'}
+   986→                          {'\n'}{'}'});
+   987→                        </div>
+   988→                        <div className="space-y-2">
+   989→                          <h4 className="text-xs font-medium text-slate-300">Lợi ích</h4>
+   990→                          <div className="flex items-start gap-2">
+   991→                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 mt-0.5 shrink-0" />
+   992→                            <span className="text-xs text-slate-400">Ứng dụng web có ngay trí nhớ dài hạn từ Hermes</span>
+   993→                          </div>
+   994→                          <div className="flex items-start gap-2">
+   995→                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 mt-0.5 shrink-0" />
+   996→                            <span className="text-xs text-slate-400">Streaming UI mượt mà với useChat hook</span>
+   997→                          </div>
+   998→                          <div className="flex items-start gap-2">
+   999→                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 mt-0.5 shrink-0" />
+  1000→                            <span className="text-xs text-slate-400">Tương thích mọi frontend hỗ trợ OpenAI API</span>
+  1001→                          </div>
+  1002→                        </div>
+  1003→                      </CardContent>
+  1004→                    </Card>
+  1005→                  </motion.div>
+  1006→
+  1007→                  {/* Model 2: Tool Executor (MCP) */}
+  1008→                  <motion.div
+  1009→                    initial={{ opacity: 0, x: 20 }}
+  1010→                    animate={{ opacity: 1, x: 0 }}
+  1011→                  >
+  1012→                    <Card className="bg-black/30 border-cyan-500/20 backdrop-blur-sm h-full">
+  1013→                      <CardHeader>
+  1014→                        <div className="flex items-center gap-3">
+  1015→                          <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-cyan-500 to-cyan-600 flex items-center justify-center">
+  1016→                            <Wrench className="w-5 h-5 text-white" />
+  1017→                          </div>
+  1018→                          <div>
+  1019→                            <CardTitle className="text-base">Mô hình 2: Tool Executor (MCP)</CardTitle>
+  1020→                            <p className="text-xs text-slate-400 mt-0.5">Hermes thực thi công cụ qua MCP protocol</p>
+  1021→                          </div>
+  1022→                        </div>
+  1023→                      </CardHeader>
+  1024→                      <CardContent className="space-y-4">
+  1025→                        <div className="p-3 rounded-xl bg-slate-800/50 border border-white/5 font-mono text-xs text-slate-300 leading-relaxed">
+  1026→                          <span className="text-slate-500"># ~/.hermes/config.yaml</span>{'\n'}
+  1027→                          <span className="text-cyan-400">mcp_servers</span>:{'\n'}
+  1028→                          {'  '}<span className="text-amber-400">web-tools</span>:{'\n'}
+  1029→                          {'    '}<span className="text-cyan-400">command</span>: npx{'\n'}
+  1030→                          {'    '}<span className="text-cyan-400">args</span>:{'\n'}
+  1031→                          {'      '}- <span className="text-emerald-400">&quot;-y&quot;</span>{'\n'}
+  1032→                          {'      '}- <span className="text-emerald-400">&quot;@modelcontextprotocol/server-web-tools&quot;</span>
+  1033→                        </div>
+  1034→                        <div className="space-y-2">
+  1035→                          <h4 className="text-xs font-medium text-slate-300">Lợi ích</h4>
+  1036→                          <div className="flex items-start gap-2">
+  1037→                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 mt-0.5 shrink-0" />
+  1038→                            <span className="text-xs text-slate-400">Tận dụng skill hệ sinh thái phong phú của Hermes từ web UI</span>
+  1039→                          </div>
+  1040→                          <div className="flex items-start gap-2">
+  1041→                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 mt-0.5 shrink-0" />
+  1042→                            <span className="text-xs text-slate-400">Chạy shell, duyệt web, gửi email trực tiếp từ dashboard</span>
+  1043→                          </div>
+  1044→                          <div className="flex items-start gap-2">
+  1045→                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 mt-0.5 shrink-0" />
+  1046→                            <span className="text-xs text-slate-400">MCP protocol linh hoạt — dễ thêm server mới</span>
+  1047→                          </div>
+  1048→                        </div>
+  1049→                      </CardContent>
+  1050→                    </Card>
+  1051→                  </motion.div>
+  1052→                </div>
+  1053→
+  1054→                {/* API Endpoints Reference */}
+  1055→                <Card className="bg-black/30 border-white/10 backdrop-blur-sm">
+  1056→                  <CardHeader>
+  1057→                    <CardTitle className="text-base flex items-center gap-2">
+  1058→                      <Code2 className="w-5 h-5 text-violet-400" />
+  1059→                      Hermes API Endpoints
+  1060→                    </CardTitle>
+  1061→                  </CardHeader>
+  1062→                  <CardContent>
+  1063→                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+  1064→                      {[
+  1065→                        { method: 'POST', path: '/v1/chat/completions', desc: 'OpenAI Chat Completions', color: 'text-emerald-400' },
+  1066→                        { method: 'POST', path: '/v1/responses', desc: 'OpenAI Responses API', color: 'text-emerald-400' },
+  1067→                        { method: 'GET', path: '/v1/models', desc: 'Danh sách models', color: 'text-cyan-400' },
+  1068→                        { method: 'GET', path: '/v1/skills', desc: 'Danh sách skills', color: 'text-cyan-400' },
+  1069→                        { method: 'GET', path: '/v1/toolsets', desc: 'Danh sách toolsets', color: 'text-cyan-400' },
+  1070→                        { method: 'GET', path: '/v1/capabilities', desc: 'Khả năng API', color: 'text-cyan-400' },
+  1071→                        { method: 'GET', path: '/api/sessions', desc: 'Danh sách sessions', color: 'text-amber-400' },
+  1072→                        { method: 'POST', path: '/v1/runs', desc: 'Chạy tác vụ async', color: 'text-emerald-400' },
+  1073→                        { method: 'GET', path: '/health/detailed', desc: 'Health check', color: 'text-cyan-400' },
+  1074→                      ].map((ep, i) => (
+  1075→                        <div key={i} className="flex items-center gap-2 p-2 rounded-lg bg-white/5 border border-white/5">
+  1076→                          <span className={`text-[10px] font-bold ${ep.color} shrink-0 w-10`}>{ep.method}</span>
+  1077→                          <code className="text-[10px] text-slate-300 truncate flex-1">{ep.path}</code>
+  1078→                          <span className="text-[10px] text-slate-500 shrink-0">{ep.desc}</span>
+  1079→                        </div>
+  1080→                      ))}
+  1081→                    </div>
+  1082→                  </CardContent>
+  1083→                </Card>
+  1084→              </div>
+  1085→            </TabsContent>
+  1086→
+  1087→            {/* Sessions Tab */}
+  1088→            <TabsContent value="sessions" className="mt-0">
+  1089→              <div className="space-y-4">
+  1090→                <div className="flex items-center justify-between">
+  1091→                  <div>
+  1092→                    <h2 className="text-xl font-bold">Phiên làm việc</h2>
+  1093→                    <p className="text-sm text-slate-400 mt-1">Các phiên hội thoại với Hermes Agent, được lưu trữ bền vững</p>
+  1094→                  </div>
+  1095→                  <Badge variant="outline" className="border-violet-500/50 text-violet-400 px-3">
+  1096→                    {sessions.length} Phiên
+  1097→                  </Badge>
+  1098→                </div>
+  1099→
+  1100→                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+  1101→                  {sessions.map((session, i) => (
+  1102→                    <motion.div
+  1103→                      key={session.id}
+  1104→                      initial={{ opacity: 0, y: 10 }}
+  1105→                      animate={{ opacity: 1, y: 0 }}
+  1106→                      transition={{ delay: i * 0.05 }}
+  1107→                    >
+  1108→                      <Card className="bg-black/30 border-white/10 backdrop-blur-sm hover:border-violet-500/30 transition-colors cursor-pointer group">
+  1109→                        <CardContent className="p-4">
+  1110→                          <div className="flex items-start justify-between mb-3">
+  1111→                            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-violet-500/20 to-cyan-500/20 border border-white/10 flex items-center justify-center group-hover:border-violet-500/30 transition-colors">
+  1112→                              <MessageSquare className="w-5 h-5 text-violet-400" />
+  1113→                            </div>
+  1114→                            <Badge variant="outline" className={`text-[10px] px-2 py-0 ${
+  1115→                              session.status === 'active' ? 'border-emerald-500/50 text-emerald-400' : 'border-slate-500/50 text-slate-400'
+  1116→                            }`}>
+  1117→                              {session.status}
+  1118→                            </Badge>
+  1119→                          </div>
+  1120→                          <h3 className="text-sm font-medium text-white mb-1 group-hover:text-violet-300 transition-colors">
+  1121→                            {session.title}
+  1122→                          </h3>
+  1123→                          <div className="flex items-center gap-3 text-[10px] text-slate-500">
+  1124→                            <span className="flex items-center gap-1">
+  1125→                              <MessageSquare className="w-3 h-3" />
+  1126→                              {session.message_count} tin nhắn
+  1127→                            </span>
+  1128→                            <span className="flex items-center gap-1">
+  1129→                              <Clock className="w-3 h-3" />
+  1130→                              {new Date(session.updated_at).toLocaleDateString('vi-VN')}
+  1131→                            </span>
+  1132→                          </div>
+  1133→                          <div className="flex items-center gap-2 mt-3 pt-3 border-t border-white/5">
+  1134→                            <Button variant="ghost" size="sm" className="h-7 text-xs text-slate-400 hover:text-white">
+  1135→                              Tiếp tục
+  1136→                              <ArrowRight className="w-3 h-3 ml-1" />
+  1137→                            </Button>
+  1138→                            <Button variant="ghost" size="sm" className="h-7 text-xs text-slate-400 hover:text-white">
+  1139→                              Fork
+  1140→                            </Button>
+  1141→                          </div>
+  1142→                        </CardContent>
+  1143→                      </Card>
+  1144→                    </motion.div>
+  1145→                  ))}
+  1146→                </div>
+  1147→
+  1148→                {/* Setup Guide when no sessions */}
+  1149→                {sessions.length === 0 && (
+  1150→                  <Card className="bg-black/30 border-white/10 backdrop-blur-sm">
+  1151→                    <CardContent className="p-8 text-center">
+  1152→                      <div className="w-16 h-16 rounded-2xl bg-violet-500/10 border border-violet-500/20 flex items-center justify-center mx-auto mb-4">
+  1153→                        <Bot className="w-8 h-8 text-violet-400" />
+  1154→                      </div>
+  1155→                      <h3 className="text-lg font-medium text-white mb-2">Chưa có phiên nào</h3>
+  1156→                      <p className="text-sm text-slate-400 mb-4">Khởi động Hermes Gateway để bắt đầu tạo phiên hội thoại</p>
+  1157→                      <div className="p-3 rounded-xl bg-slate-800/50 border border-white/5 font-mono text-xs text-slate-300 inline-block">
+  1158→                        $ hermes gateway
+  1159→                      </div>
+  1160→                    </CardContent>
+  1161→                  </Card>
+  1162→                )}
+  1163→              </div>
+  1164→            </TabsContent>
+  1165→
+  1166→            {/* Search Tab - Perplexity-style Smart Search */}
+  1167→            <TabsContent value="search" className="flex-1 mt-0">
+  1168→              <div className="space-y-4">
+  1169→                {/* Search Header */}
+  1170→                <div>
+  1171→                  <h2 className="text-xl font-bold flex items-center gap-2">
+  1172→                    <Sparkles className="w-5 h-5 text-orange-400" />
+  1173→                    Tìm kiếm thông minh
+  1174→                  </h2>
+  1175→                  <p className="text-sm text-slate-400 mt-1">Tìm kiếm thông tin từ web, địa điểm, cửa hàng, giấy phép kinh doanh — không cần API trả phí</p>
+  1176→                </div>
+  1177→
+  1178→                {/* Search Input */}
+  1179→                <div className="relative">
+  1180→                  <div className="flex gap-3">
+  1181→                    <div className="flex-1 relative">
+  1182→                      <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" />
+  1183→                      <input
+  1184→                        type="text"
+  1185→                        value={searchQuery}
+  1186→                        onChange={(e) => setSearchQuery(e.target.value)}
+  1187→                        onKeyDown={(e) => { if (e.key === 'Enter') handleSearch(); }}
+  1188→                        placeholder="Tìm cửa hàng, địa điểm, giấy phép kinh doanh..."
+  1189→                        className="w-full rounded-xl border border-white/10 bg-white/5 pl-12 pr-4 py-3.5 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-orange-500/50 focus:border-orange-500/50"
+  1190→                        disabled={isSearching}
+  1191→                      />
+  1192→                    </div>
+  1193→                    {/* Search Mode Selector */}
+  1194→                    <div className="flex rounded-xl border border-white/10 overflow-hidden">
+  1195→                      {[
+  1196→                        { mode: 'smart' as const, label: 'Thông minh', icon: Sparkles },
+  1197→                        { mode: 'places' as const, label: 'Địa điểm', icon: MapPin },
+  1198→                        { mode: 'business' as const, label: 'Doanh nghiệp', icon: Building2 },
+  1199→                      ].map((m) => (
+  1200→                        <button
+  1201→                          key={m.mode}
+  1202→                          onClick={() => setSearchMode(m.mode)}
+  1203→                          className={`flex items-center gap-1.5 px-3 py-2 text-xs transition-all ${
+  1204→                            searchMode === m.mode
+  1205→                              ? 'bg-orange-500/20 text-orange-300 border-r border-white/10'
+  1206→                              : 'bg-white/5 text-slate-400 hover:bg-white/10 border-r border-white/10 last:border-r-0'
+  1207→                          }`}
+  1208→                        >
+  1209→                          <m.icon className="w-3.5 h-3.5" />
+  1210→                          <span className="hidden sm:inline">{m.label}</span>
+  1211→                        </button>
+  1212→                      ))}
+  1213→                    </div>
+  1214→                    <Button
+  1215→                      onClick={handleSearch}
+  1216→                      disabled={isSearching || !searchQuery.trim()}
+  1217→                      data-search-btn
+  1218→                      className="px-5 rounded-xl bg-gradient-to-r from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 text-white shadow-lg shadow-orange-500/20"
+  1219→                    >
+  1220→                      {isSearching ? (
+  1221→                        <Loader2 className="w-4 h-4 animate-spin" />
+  1222→                      ) : (
+  1223→                        <Search className="w-4 h-4" />
+  1224→                      )}
+  1225→                    </Button>
+  1226→                  </div>
+  1227→                </div>
+  1228→
+  1229→                {/* Quick Search Suggestions */}
+  1230→                {!searchResult && !isSearching && (
+  1231→                  <div className="space-y-4">
+  1232→                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+  1233→                      {[
+  1234→                        { icon: Building2, text: 'Cửa hàng tiện lợi tại TP.HCM', mode: 'places' as const, color: 'text-emerald-400 bg-emerald-500/10' },
+  1235→                        { icon: FileCheck, text: 'Giấy phép kinh doanh quán cafe', mode: 'business' as const, color: 'text-amber-400 bg-amber-500/10' },
+  1236→                        { icon: MapPin, text: 'Nhà hàng Quận 1 TP.HCM', mode: 'places' as const, color: 'text-cyan-400 bg-cyan-500/10' },
+  1237→                        { icon: BookOpen, text: 'Quy định đăng ký kinh doanh 2026', mode: 'smart' as const, color: 'text-violet-400 bg-violet-500/10' },
+  1238→                        { icon: Building2, text: 'Phòng khám tư nhân Hà Nội', mode: 'business' as const, color: 'text-rose-400 bg-rose-500/10' },
+  1239→                        { icon: Lightbulb, text: 'Xu hướng kinh doanh năm 2026', mode: 'smart' as const, color: 'text-orange-400 bg-orange-500/10' },
+  1240→                      ].map((suggestion, i) => (
+  1241→                        <motion.button
+  1242→                          key={i}
+  1243→                          initial={{ opacity: 0, y: 10 }}
+  1244→                          animate={{ opacity: 1, y: 0 }}
+  1245→                          transition={{ delay: i * 0.05 }}
+  1246→                          onClick={() => {
+  1247→                            setSearchQuery(suggestion.text);
+  1248→                            setSearchMode(suggestion.mode);
+  1249→                            // Auto-search: set query param and trigger via ref
+  1250→                            setTimeout(() => {
+  1251→                              const searchBtn = document.querySelector('[data-search-btn]') as HTMLButtonElement;
+  1252→                              if (searchBtn) searchBtn.click();
+  1253→                            }, 200);
+  1254→                          }}
+  1255→                          className="flex items-center gap-3 p-3 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 transition-all text-left group"
+  1256→                        >
+  1257→                          <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${suggestion.color}`}>
+  1258→                            <suggestion.icon className="w-4 h-4" />
+  1259→                          </div>
+  1260→                          <span className="text-sm text-slate-300 group-hover:text-white transition-colors">{suggestion.text}</span>
+  1261→                        </motion.button>
+  1262→                      ))}
+  1263→                    </div>
+  1264→
+  1265→                    {/* Search History */}
+  1266→                    {searchHistory.length > 0 && (
+  1267→                      <div>
+  1268→                        <h3 className="text-xs text-slate-500 uppercase tracking-wider mb-2">Tìm kiếm gần đây</h3>
+  1269→                        <div className="flex flex-wrap gap-2">
+  1270→                          {searchHistory.slice(0, 5).map((q, i) => (
+  1271→                            <button
+  1272→                              key={i}
+  1273→                              onClick={() => setSearchQuery(q)}
+  1274→                              className="px-3 py-1 rounded-full border border-white/10 bg-white/5 text-xs text-slate-400 hover:text-white hover:bg-white/10 transition-all"
+  1275→                            >
+  1276→                              {q}
+  1277→                            </button>
+  1278→                          ))}
+  1279→                        </div>
+  1280→                      </div>
+  1281→                    )}
+  1282→
+  1283→                    {/* How it works */}
+  1284→                    <Card className="bg-black/30 border-white/10 backdrop-blur-sm">
+  1285→                      <CardContent className="p-5">
+  1286→                        <h3 className="text-sm font-medium text-slate-300 mb-3">Cách hoạt động</h3>
+  1287→                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+  1288→                          <div className="flex items-start gap-2">
+  1289→                            <div className="w-6 h-6 rounded-full bg-orange-500/20 flex items-center justify-center shrink-0 text-xs text-orange-400 font-bold">1</div>
+  1290→                            <div>
+  1291→                              <p className="text-xs font-medium text-slate-300">Tìm kiếm web</p>
+  1292→                              <p className="text-[10px] text-slate-500">z-ai-web-dev-sdk tìm kiếm nhiều nguồn</p>
+  1293→                            </div>
+  1294→                          </div>
+  1295→                          <div className="flex items-start gap-2">
+  1296→                            <div className="w-6 h-6 rounded-full bg-orange-500/20 flex items-center justify-center shrink-0 text-xs text-orange-400 font-bold">2</div>
+  1297→                            <div>
+  1298→                              <p className="text-xs font-medium text-slate-300">Đọc & phân tích</p>
+  1299→                              <p className="text-[10px] text-slate-500">Qwen 3.5 Flash tổng hợp thông tin</p>
+  1300→                            </div>
+  1301→                          </div>
+  1302→                          <div className="flex items-start gap-2">
+  1303→                            <div className="w-6 h-6 rounded-full bg-orange-500/20 flex items-center justify-center shrink-0 text-xs text-orange-400 font-bold">3</div>
+  1304→                            <div>
+  1305→                              <p className="text-xs font-medium text-slate-300">Trả lời + Bản đồ</p>
+  1306→                              <p className="text-[10px] text-slate-500">OpenStreetMap hiển thị địa điểm</p>
+  1307→                            </div>
+  1308→                          </div>
+  1309→                        </div>
+  1310→                      </CardContent>
+  1311→                    </Card>
+  1312→                  </div>
+  1313→                )}
+  1314→
+  1315→                {/* Loading State */}
+  1316→                {isSearching && (
+  1317→                  <div className="flex flex-col items-center justify-center py-16">
+  1318→                    <div className="w-16 h-16 rounded-2xl bg-orange-500/10 border border-orange-500/20 flex items-center justify-center mb-4">
+  1319→                      <Loader2 className="w-8 h-8 text-orange-400 animate-spin" />
+  1320→                    </div>
+  1321→                    <p className="text-sm text-slate-400 mb-2">Đang tìm kiếm...</p>
+  1322→                    <div className="flex items-center gap-4 text-xs text-slate-500">
+  1323→                      <span className="flex items-center gap-1"><Globe className="w-3 h-3" /> Tìm kiếm web</span>
+  1324→                      <span className="flex items-center gap-1"><BookOpen className="w-3 h-3" /> Đọc trang</span>
+  1325→                      <span className="flex items-center gap-1"><Brain className="w-3 h-3" /> AI tổng hợp</span>
+  1326→                    </div>
+  1327→                  </div>
+  1328→                )}
+  1329→
+  1330→                {/* Search Results */}
+  1331→                {searchResult && !isSearching && (
+  1332→                  <div className="space-y-4">
+  1333→                    {/* Sources Bar */}
+  1334→                    {searchResult.sources.length > 0 && (
+  1335→                      <div>
+  1336→                        <h3 className="text-xs text-slate-500 uppercase tracking-wider mb-2">Nguồn tham khảo</h3>
+  1337→                        <div className="flex gap-2 overflow-x-auto pb-2">
+  1338→                          {searchResult.sources.slice(0, 8).map((source) => (
+  1339→                            <a
+  1340→                              key={source.id}
+  1341→                              href={source.url}
+  1342→                              target="_blank"
+  1343→                              rel="noopener noreferrer"
+  1344→                              className="flex items-center gap-2 px-3 py-2 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 transition-all shrink-0 max-w-[200px]"
+  1345→                            >
+  1346→                              <div className="w-5 h-5 rounded bg-orange-500/20 flex items-center justify-center shrink-0">
+  1347→                                <span className="text-[9px] text-orange-400 font-bold">{source.id}</span>
+  1348→                              </div>
+  1349→                              <div className="min-w-0">
+  1350→                                <p className="text-[10px] text-slate-300 truncate">{source.name}</p>
+  1351→                                <p className="text-[9px] text-slate-600 truncate">{source.host_name || source.url}</p>
+  1352→                              </div>
+  1353→                            </a>
+  1354→                          ))}
+  1355→                        </div>
+  1356→                      </div>
+  1357→                    )}
+  1358→
+  1359→                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+  1360→                      {/* AI Answer Panel */}
+  1361→                      <div className={`${searchResult.places.length > 0 ? 'lg:col-span-2' : 'lg:col-span-3'}`}>
+  1362→                        <Card className="bg-black/30 border-white/10 backdrop-blur-sm">
+  1363→                          <CardHeader className="pb-3">
+  1364→                            <CardTitle className="text-sm font-medium flex items-center gap-2">
+  1365→                              <Sparkles className="w-4 h-4 text-orange-400" />
+  1366→                              Kết quả tìm kiếm
+  1367→                              <Badge variant="outline" className="text-[9px] px-1.5 py-0 ml-auto border-white/10 text-slate-400">
+  1368→                                {searchResult.sources.length} nguồn
+  1369→                              </Badge>
+  1370→                            </CardTitle>
+  1371→                          </CardHeader>
+  1372→                          <CardContent>
+  1373→                            <div className="prose prose-invert prose-sm max-w-none text-slate-200 leading-relaxed whitespace-pre-wrap">
+  1374→                              {searchResult.answer}
+  1375→                            </div>
+  1376→                          </CardContent>
+  1377→                        </Card>
+  1378→                      </div>
+  1379→
+  1380→                      {/* Map Panel - show when there are places */}
+  1381→                      {searchResult.places.length > 0 && (
+  1382→                        <div className="space-y-3">
+  1383→                          <Card className="bg-black/30 border-white/10 backdrop-blur-sm overflow-hidden">
+  1384→                            <div className="h-64">
+  1385→                              <MapComponent
+  1386→                                places={searchResult.places}
+  1387→                                selectedPlace={selectedSearchPlace}
+  1388→                                onPlaceSelect={(place) => setSelectedSearchPlace(place)}
+  1389→                              />
+  1390→                            </div>
+  1391→                          </Card>
+  1392→                          
+  1393→                          {/* Places List */}
+  1394→                          <Card className="bg-black/30 border-white/10 backdrop-blur-sm">
+  1395→                            <CardHeader className="pb-2">
+  1396→                              <CardTitle className="text-xs font-medium flex items-center gap-2">
+  1397→                                <MapPin className="w-3.5 h-3.5 text-orange-400" />
+  1398→                                Địa điểm ({searchResult.places.length})
+  1399→                              </CardTitle>
+  1400→                            </CardHeader>
+  1401→                            <CardContent>
+  1402→                              <ScrollArea className="max-h-64">
+  1403→                                <div className="space-y-2">
+  1404→                                  {searchResult.places.map((place) => (
+  1405→                                    <button
+  1406→                                      key={place.id}
+  1407→                                      onClick={() => setSelectedSearchPlace(place)}
+  1408→                                      className={`w-full text-left p-2.5 rounded-lg border transition-all ${
+  1409→                                        selectedSearchPlace?.id === place.id
+  1410→                                          ? 'border-orange-500/50 bg-orange-500/10'
+  1411→                                          : 'border-white/5 bg-white/5 hover:bg-white/10'
+  1412→                                      }`}
+  1413→                                    >
+  1414→                                      <div className="flex items-start gap-2">
+  1415→                                        <MapPin className="w-3.5 h-3.5 text-orange-400 mt-0.5 shrink-0" />
+  1416→                                        <div className="min-w-0">
+  1417→                                          <p className="text-xs font-medium text-slate-200 truncate">{place.name}</p>
+  1418→                                          <p className="text-[10px] text-slate-500 truncate">{place.fullAddress?.split(',').slice(0, 3).join(',')}</p>
+  1419→                                          <div className="flex items-center gap-2 mt-1">
+  1420→                                            {place.phone && (
+  1421→                                              <span className="flex items-center gap-0.5 text-[9px] text-slate-400">
+  1422→                                                <Phone className="w-2.5 h-2.5" />
+  1423→                                                {place.phone}
+  1424→                                              </span>
+  1425→                                            )}
+  1426→                                            {place.website && (
+  1427→                                              <a href={place.website} target="_blank" rel="noopener noreferrer" className="flex items-center gap-0.5 text-[9px] text-cyan-400 hover:text-cyan-300" onClick={(e) => e.stopPropagation()}>
+  1428→                                                <ExternalLink className="w-2.5 h-2.5" />
+  1429→                                                Website
+  1430→                                              </a>
+  1431→                                            )}
+  1432→                                          </div>
+  1433→                                        </div>
+  1434→                                      </div>
+  1435→                                    </button>
+  1436→                                  ))}
+  1437→                                </div>
+  1438→                              </ScrollArea>
+  1439→                            </CardContent>
+  1440→                          </Card>
+  1441→                        </div>
+  1442→                      )}
+  1443→                    </div>
+  1444→                  </div>
+  1445→                )}
+  1446→              </div>
+  1447→            </TabsContent>
+  1448→
+  1449→          </Tabs>
+  1450→        </main>
+  1451→
+  1452→        {/* Footer */}
+  1453→        <footer className="border-t border-white/10 bg-black/20 mt-auto">
+  1454→          <div className="max-w-7xl mx-auto px-4 sm:px-6 py-3 flex items-center justify-between">
+  1455→            <div className="flex items-center gap-4 text-xs text-slate-500">
+  1456→              <span className="flex items-center gap-1.5">
+  1457→                <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-emerald-400' : 'bg-red-400'}`} />
+  1458→                {isConnected ? 'Hermes Gateway kết nối' : 'Hermes Gateway ngắt kết nối'}
+  1459→              </span>
+  1460→              <span>·</span>
+  1461→              <span>Built with Next.js 16 + Vercel AI SDK</span>
+  1462→            </div>
+  1463→            <div className="text-xs text-slate-600">
+  1464→              Hermes Agent + Vercel AI SDK
+  1465→            </div>
+  1466→          </div>
+  1467→        </footer>
+  1468→      </div>
+  1469→    </TooltipProvider>
+  1470→  );
+  1471→}
+  1472→
