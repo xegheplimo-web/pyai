@@ -9,7 +9,7 @@ import {
   Send, RotateCcw, Sparkles, Layers, Code2, Shield,
   Eye, Image, Mic, Search, Wrench, Bot, ArrowRight,
   CheckCircle2, XCircle, Clock, FolderOpen, FileText,
-  LayoutDashboard, Settings, RefreshCw
+  LayoutDashboard, Settings, RefreshCw, ChevronDown, CpuIcon
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -50,6 +50,32 @@ interface Toolset {
   description: string;
   tools: string[];
 }
+
+// Available models configuration
+const AVAILABLE_MODELS = [
+  {
+    id: 'qwen3.5-flash',
+    name: 'Qwen 3.5 Flash',
+    provider: 'Alibaba Cloud (DashScope)',
+    description: 'Model nhanh và mạnh mẽ từ Alibaba, hỗ trợ đa ngôn ngữ',
+    icon: Cpu,
+    color: 'from-orange-500 to-amber-500',
+    bgColor: 'bg-orange-500/10 border-orange-500/30',
+    textColor: 'text-orange-400',
+    apiBaseUrl: 'https://ws-09yuoi7zzbynceax.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1',
+  },
+  {
+    id: 'hermes-agent',
+    name: 'Hermes Agent',
+    provider: 'Nous Research (Local)',
+    description: 'Agent tự trị có trí nhớ bền vững, chạy cục bộ',
+    icon: Brain,
+    color: 'from-violet-500 to-purple-500',
+    bgColor: 'bg-violet-500/10 border-violet-500/30',
+    textColor: 'text-violet-400',
+    apiBaseUrl: 'http://127.0.0.1:8642/v1',
+  },
+];
 
 // Category icon mapping
 const categoryIcons: Record<string, any> = {
@@ -100,12 +126,17 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState('chat');
   const [isLoadingStatus, setIsLoadingStatus] = useState(true);
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
+  const [selectedModel, setSelectedModel] = useState('qwen3.5-flash');
+  const [showModelPicker, setShowModelPicker] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  const currentModel = AVAILABLE_MODELS.find(m => m.id === selectedModel) || AVAILABLE_MODELS[0];
 
   const { messages, input, handleInputChange, handleSubmit, isLoading, reload, setMessages } = useChat({
     api: '/api/chat',
     initialMessages: [],
+    body: { model: selectedModel },
     onError: (err) => {
       console.error('Chat error:', err);
     },
@@ -155,6 +186,20 @@ export default function Home() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  // Close model picker when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (showModelPicker) {
+        const target = e.target as HTMLElement;
+        if (!target.closest('[data-model-picker]')) {
+          setShowModelPicker(false);
+        }
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [showModelPicker]);
+
   const isConnected = hermesStatus?.connected ?? false;
 
   // Group skills by category
@@ -187,7 +232,69 @@ export default function Home() {
             </div>
 
             <div className="flex items-center gap-3">
-              {/* Connection status */}
+              {/* Model Picker */}
+              <div className="relative z-50" data-model-picker>
+                <button
+                  onClick={() => setShowModelPicker(!showModelPicker)}
+                  className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs transition-all ${currentModel.bgColor} hover:opacity-80`}
+                >
+                  <currentModel.icon className="w-3.5 h-3.5" />
+                  <span className={`font-medium ${currentModel.textColor}`}>{currentModel.name}</span>
+                  <ChevronDown className={`w-3 h-3 ${currentModel.textColor} transition-transform ${showModelPicker ? 'rotate-180' : ''}`} />
+                </button>
+                
+                <AnimatePresence>
+                  {showModelPicker && (
+                    <motion.div
+                      initial={{ opacity: 0, y: -5, scale: 0.95 }}
+                      animate={{ opacity: 1, y: 0, scale: 1 }}
+                      exit={{ opacity: 0, y: -5, scale: 0.95 }}
+                      transition={{ duration: 0.15 }}
+                      className="absolute right-0 top-full mt-2 w-72 rounded-xl border border-white/10 bg-slate-900/95 backdrop-blur-xl shadow-2xl shadow-black/40 z-50 overflow-hidden"
+                    >
+                      <div className="p-2 border-b border-white/5">
+                        <p className="text-[10px] text-slate-500 uppercase tracking-wider px-2">Chọn Model</p>
+                      </div>
+                      <div className="p-1.5">
+                        {AVAILABLE_MODELS.map((model) => {
+                          const ModelIcon = model.icon;
+                          const isSelected = model.id === selectedModel;
+                          return (
+                            <button
+                              key={model.id}
+                              onClick={() => {
+                                setSelectedModel(model.id);
+                                setShowModelPicker(false);
+                              }}
+                              className={`w-full flex items-start gap-3 p-2.5 rounded-lg transition-all text-left ${
+                                isSelected
+                                  ? model.bgColor
+                                  : 'hover:bg-white/5'
+                              }`}
+                            >
+                              <div className={`w-8 h-8 rounded-lg bg-gradient-to-br ${model.color} flex items-center justify-center shrink-0 mt-0.5`}>
+                                <ModelIcon className="w-4 h-4 text-white" />
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-2">
+                                  <span className="text-sm font-medium text-white">{model.name}</span>
+                                  {isSelected && (
+                                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                                  )}
+                                </div>
+                                <span className="text-[10px] text-slate-500">{model.provider}</span>
+                                <p className="text-[10px] text-slate-400 mt-0.5">{model.description}</p>
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+
+              {/* Connection status - Hermes */}
               <motion.div
                 initial={{ opacity: 0, scale: 0.9 }}
                 animate={{ opacity: 1, scale: 1 }}
@@ -315,8 +422,8 @@ export default function Home() {
                             className={`flex gap-3 ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
                           >
                             {message.role === 'assistant' && (
-                              <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-violet-500 to-cyan-500 flex items-center justify-center shrink-0 mt-1">
-                                <Brain className="w-4 h-4 text-white" />
+                              <div className={`w-8 h-8 rounded-lg bg-gradient-to-br ${currentModel.color} flex items-center justify-center shrink-0 mt-1`}>
+                                <currentModel.icon className="w-4 h-4 text-white" />
                               </div>
                             )}
                             <div
@@ -337,8 +444,8 @@ export default function Home() {
                         ))}
                         {isLoading && (
                           <div className="flex gap-3">
-                            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-violet-500 to-cyan-500 flex items-center justify-center shrink-0">
-                              <Brain className="w-4 h-4 text-white animate-pulse" />
+                            <div className={`w-8 h-8 rounded-lg bg-gradient-to-br ${currentModel.color} flex items-center justify-center shrink-0`}>
+                              <currentModel.icon className="w-4 h-4 text-white animate-pulse" />
                             </div>
                             <div className="bg-white/5 border border-white/10 rounded-2xl px-4 py-3">
                               <div className="flex gap-1.5">
@@ -368,7 +475,10 @@ export default function Home() {
                               handleSubmit(e as any);
                             }
                           }}
-                          placeholder={isConnected ? 'Nhập tin nhắn cho Hermes Agent...' : 'Hermes Agent đang offline — nhắn tin sẽ không được xử lý'}
+                          placeholder={selectedModel === 'hermes-agent' 
+                            ? (isConnected ? 'Nhập tin nhắn cho Hermes Agent...' : 'Hermes Agent đang offline — nhắn tin sẽ không được xử lý')
+                            : 'Nhập tin nhắn cho Qwen 3.5 Flash...'
+                          }
                           className="w-full rounded-xl border border-white/10 bg-white/5 px-4 py-3 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-violet-500/50 focus:border-violet-500/50 resize-none min-h-[44px] max-h-32"
                           rows={1}
                           disabled={isLoading}
@@ -402,9 +512,12 @@ export default function Home() {
                       </div>
                     </form>
                     <div className="flex items-center gap-3 mt-2 text-xs text-slate-500">
-                      <span>Model: <span className="text-slate-400">hermes-agent</span></span>
+                      <span className={`flex items-center gap-1 ${currentModel.textColor}`}>
+                        <currentModel.icon className="w-3 h-3" />
+                        {currentModel.name}
+                      </span>
                       <span>·</span>
-                      <span>API: <span className="text-slate-400">{hermesStatus?.apiBaseUrl || 'http://127.0.0.1:8642'}</span></span>
+                      <span>API: <span className="text-slate-400">{currentModel.apiBaseUrl}</span></span>
                       <span>·</span>
                       <span>Protocol: <span className="text-slate-400">OpenAI-compatible</span></span>
                     </div>
@@ -423,14 +536,20 @@ export default function Home() {
                     </CardHeader>
                     <CardContent className="space-y-3">
                       <div className="flex items-center justify-between">
+                        <span className="text-xs text-slate-400">Model hiện tại</span>
+                        <Badge variant="outline" className={`text-[10px] px-2 py-0 ${currentModel.bgColor} ${currentModel.textColor}`}>
+                          {currentModel.name}
+                        </Badge>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs text-slate-400">Provider</span>
+                        <span className="text-[10px] text-slate-300">{currentModel.provider}</span>
+                      </div>
+                      <div className="flex items-center justify-between">
                         <span className="text-xs text-slate-400">Hermes Gateway</span>
                         <Badge variant="outline" className={`text-[10px] px-2 py-0 ${isConnected ? 'border-emerald-500/50 text-emerald-400' : 'border-red-500/50 text-red-400'}`}>
                           {isConnected ? 'Online' : 'Offline'}
                         </Badge>
-                      </div>
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs text-slate-400">API Port</span>
-                        <span className="text-xs text-slate-300">:8642</span>
                       </div>
                       <div className="flex items-center justify-between">
                         <span className="text-xs text-slate-400">Protocol</span>

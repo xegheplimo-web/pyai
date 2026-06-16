@@ -30,3 +30,29 @@ Stage Summary:
 - Architecture diagram showing 8 nodes and 7 connections with labels
 - Code examples for both integration models (Model Provider and MCP Tool Executor)
 - API endpoints reference card with 9 endpoints
+
+---
+Task ID: 2
+Agent: Super Z (main)
+Task: Add Qwen 3.5 Flash model configuration to dashboard
+
+Work Log:
+- Added Qwen 3.5 Flash config to .env: QWEN_API_KEY, QWEN_BASE_URL, QWEN_MODEL
+- Updated /api/chat route to support multi-model selection (hermes-agent + qwen3.5-flash)
+- Added AVAILABLE_MODELS configuration with metadata (name, provider, description, icon, colors, apiBaseUrl)
+- Added model picker dropdown in header with animated AnimatePresence transitions
+- Added selectedModel state and showModelPicker state
+- Updated useChat hook with body: { model: selectedModel } for model selection
+- Updated chat messages to show current model icon (Cpu for Qwen, Brain for Hermes)
+- Updated loading indicator with current model icon
+- Updated chat input placeholder to reflect current model
+- Updated sidebar connection status to show current model and provider
+- Added click-outside handler for model picker dropdown
+- Fixed z-index bug: added z-50 to model picker parent for proper stacking
+- Verified with Agent Browser: model picker works, both models listed, switching works
+
+Stage Summary:
+- Qwen 3.5 Flash (Alibaba Cloud/DashScope) is the default model
+- Model picker dropdown in header allows switching between Qwen 3.5 Flash and Hermes Agent
+- API route routes to correct provider based on model selection
+- Qwen uses OpenAI-compatible endpoint at ws-09yuoi7zzbynceax.ap-southeast-1.maas.aliyuncs.com
