@@ -2,6 +2,8 @@
 
 **Hệ thống Đa tác tử Tìm kiếm Thông minh** — Kiến trúc 3 tầng OpenClaw × Ruflo × Hive, nghiên cứu tự chủ như Perplexity, chạy hoàn toàn local trên RTX 3090.
 
+> **💡 Lưu ý quan trọng**: OpenClaw **đã có sẵn UI, Telegram, WhatsApp, SearXNG, Ollama extensions** — không cần viết Streamlit hay bot riêng! Chạy `npx openclaw onboard` để bắt đầu.
+
 ## 🖥️ Tối ưu cho cấu hình
 
 | Linh kiện | Cấu hình | Phân bổ cho MAS |
