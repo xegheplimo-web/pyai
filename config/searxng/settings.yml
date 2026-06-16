@@ -1,0 +1,89 @@
+use_default_settings: true
+
+general:
+  instance_name: "MAS-OpenClaw Search"
+  debug: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "vi"
+  formats:
+    - html
+    - json
+
+server:
+  secret_key: "mas-openclaw-secret-change-me"
+  bind_address: "0.0.0.0"
+  port: 8080
+  limiter: false
+  image_proxy: true
+
+ui:
+  static_use_hash: true
+  default_locale: "vi"
+
+outgoing:
+  request_timeout: 15
+  max_request_timeout: 30
+  useragent_suffix: ""
+  pool_connections: 100
+  pool_maxsize: 20
+
+engines:
+  - name: google
+    engine: google
+    shortcut: g
+    disabled: false
+  - name: bing
+    engine: bing
+    shortcut: b
+    disabled: false
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
+  - name: brave
+    engine: brave
+    shortcut: br
+    disabled: false
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    disabled: false
+  - name: wikidata
+    engine: wikidata
+    shortcut: wd
+    disabled: false
+  - name: github
+    engine: github
+    shortcut: gh
+    disabled: false
+  - name: stackoverflow
+    engine: stackoverflow
+    shortcut: st
+    disabled: false
+  - name: arxiv
+    engine: arxiv
+    shortcut: ar
+    disabled: false
+  - name: semantic scholar
+    engine: semantic_scholar
+    shortcut: ss
+    disabled: false
+  - name: pubmed
+    engine: pubmed
+    shortcut: pm
+    disabled: false
+  - name: reddit
+    engine: reddit
+    shortcut: re
+    disabled: false
+  - name: hackernews
+    engine: hackernews
+    shortcut: hn
+    disabled: false
+  - name: youtube
+    engine: youtube_noapi
+    shortcut: yt
+    disabled: false

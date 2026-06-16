@@ -1,0 +1,209 @@
+# ============================================================
+# Hive + MAS-OpenClaw Integration Configuration
+# ============================================================
+# 
+# Kiến trúc tích hợp:
+#   Hive = Production Harness (quản lý, phục hồi, tiến hóa)
+#   MAS-OpenClaw = Intelligence Layer (tìm kiếm, nghiên cứu, phân tích)
+#
+# Hive điều phối MAS-OpenClaw thông qua:
+#   1. MCP Tools - Đăng ký SearXNG search, Web Scraper, Doc Reader như MCP tools
+#   2. Sub-Agent Delegation - MAS agents chạy như Hive sub-agents
+#   3. Data Buffer - Kết quả nghiên cứu chia sẻ qua Hive Data Buffer
+# ============================================================
+
+# --- Hive Configuration ---
+hive:
+  version: "0.1.0"
+  name: "mas-openclaw-hive"
+  
+  # Default LLM - Qwen2.5:14b local qua Ollama
+  default_provider: "ollama"
+  default_model: "qwen2.5:14b"
+  
+  # Hive supports Ollama via LiteLLM
+  providers:
+    ollama:
+      api_base: "http://localhost:11434"
+      models:
+        - name: "qwen2.5:14b"
+          context_window: 16384
+          max_tokens: 4096
+    # Backup cloud providers (optional)
+    anthropic:
+      api_key: "${ANTHROPIC_API_KEY}"
+      models: ["claude-sonnet-4-20250514"]
+    openai:
+      api_key: "${OPENAI_API_KEY}"
+      models: ["gpt-4o"]
+
+  # Agent graph specification
+  agents:
+    # --- Main Orchestrator (Queen Bee) ---
+    orchestrator:
+      role: "queen"
+      model: "ollama/qwen2.5:14b"
+      description: "Điều phối nghiên cứu - phân tích query, lập kế hoạch, giám sát"
+      tools:
+        - "searxng_search"
+        - "delegate_to_sub_agent"
+      success_criteria:
+        - criterion: "Kế hoạch nghiên cứu đầy đủ các khía cạnh"
+          weight: 0.5
+        - criterion: "Từ khóa tìm kiếm tối ưu cả VI và EN"
+          weight: 0.3
+        - criterion: "Nguồn phù hợp được xác định"
+          weight: 0.2
+
+    # --- Search Agent (Worker Bee) ---
+    search:
+      role: "worker"
+      model: "ollama/qwen2.5:14b"
+      description: "Tìm kiếm đa nguồn qua SearXNG"
+      tools:
+        - "searxng_search"
+        - "multi_category_search"
+        - "web_scraper"
+      success_criteria:
+        - criterion: "Tìm thấy ít nhất 5 nguồn liên quan"
+          weight: 0.4
+        - criterion: "Nguồn đa dạng (web, academic, technical)"
+          weight: 0.3
+        - criterion: "Nguồn đáng tin cậy (rank > 0.5)"
+          weight: 0.3
+
+    # --- Research Agent (Worker Bee) ---
+    research:
+      role: "worker"
+      model: "ollama/qwen2.5:14b"
+      description: "Đọc sâu và trích xuất thông tin từ nguồn"
+      tools:
+        - "web_scraper"
+        - "batch_web_scraper"
+        - "document_reader"
+      success_criteria:
+        - criterion: "Trích xuất đầy đủ thông tin chính"
+          weight: 0.5
+        - criterion: "Mỗi thông tin có nguồn trích dẫn"
+          weight: 0.3
+        - criterion: "Đánh giá độ tin cậy nguồn"
+          weight: 0.2
+
+    # --- Analysis Agent (Worker Bee) ---
+    analysis:
+      role: "worker"
+      model: "ollama/qwen2.5:14b"
+      description: "Phân tích chéo, xác minh, đánh giá đa chiều"
+      tools:
+        - "searxng_search"
+        - "web_scraper"
+      success_criteria:
+        - criterion: "So sánh được thông tin từ 3+ nguồn"
+          weight: 0.4
+        - criterion: "Phát hiện mâu thuẫn nếu có"
+          weight: 0.3
+        - criterion: "Đánh giá bias và độ tin cậy"
+          weight: 0.3
+
+    # --- Response Agent (Worker Bee) ---
+    response:
+      role: "worker"
+      model: "ollama/qwen2.5:14b"
+      description: "Tổng hợp câu trả lời hoàn chỉnh với trích dẫn"
+      tools: []
+      success_criteria:
+        - criterion: "Cấu trúc rõ ràng (tóm tắt → chi tiết → kết luận)"
+          weight: 0.3
+        - criterion: "Mỗi thông tin có nguồn trích dẫn"
+          weight: 0.4
+        - criterion: "Nội dung phong phú, không hời hợt"
+          weight: 0.3
+
+  # --- Judge Configuration ---
+  judge:
+    model: "ollama/qwen2.5:14b"
+    evaluation_interval: 120  # seconds
+    degradation_patterns:
+      - "doom_loop"       # Agent lặp lại cùng hành động
+      - "stall"           # Agent không tiến triển
+      - "excessive_retry" # Quá nhiều lần thử
+      - "low_quality"     # Kết quả không đạt success criteria
+    verdicts:
+      - "ACCEPT"   # Chấp nhận kết quả
+      - "RETRY"    # Thử lại với feedback
+      - "ESCALATE" # Chuyển lên Queen (human-in-the-loop)
+
+  # --- Edges (Flow Control) ---
+  edges:
+    - from: "orchestrator"
+      to: "search"
+      condition: "success"
+    - from: "search"
+      to: "research"
+      condition: "success"
+    - from: "research"
+      to: "analysis"
+      condition: "success"
+    - from: "analysis"
+      to: "response"
+      condition: "success"
+    # Failure paths
+    - from: "search"
+      to: "orchestrator"
+      condition: "failure"
+      label: "replan_search"
+    - from: "research"
+      to: "search"
+      condition: "failure"
+      label: "find_more_sources"
+
+  # --- Evolution Settings ---
+  evolution:
+    enabled: true
+    trigger: "failure"
+    scope:
+      - "prompts"      # Tự tối ưu prompt
+      - "edges"        # Điều chỉnh flow
+      - "tools"        # Thêm/bớt tools
+    max_evolution_rounds: 3
+
+  # --- Cost Control ---
+  cost:
+    max_tokens_per_run: 100000
+    max_cost_per_run: 0.0  # Local model = miễn phí!
+    max_retries_per_node: 3
+
+  # --- Crash Recovery ---
+  recovery:
+    enabled: true
+    checkpoint_interval: 30  # seconds
+    max_recovery_attempts: 2
+
+# --- SearXNG Integration ---
+searxng:
+  host: "http://localhost:8888"
+  categories:
+    - "general"
+    - "news"
+    - "science"
+    - "it"
+    - "images"
+  engines:
+    - "google"
+    - "bing"
+    - "duckduckgo"
+    - "brave"
+    - "wikipedia"
+    - "arxiv"
+    - "github"
+    - "stackoverflow"
+    - "reddit"
+
+# --- Ollama Integration ---
+ollama:
+  host: "http://localhost:11434"
+  model: "qwen2.5:14b"
+  gpu_layers: 99
+  num_parallel: 4
+  flash_attention: true
+  num_ctx: 16384
