@@ -1,157 +1,206 @@
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 
-// Nominatim (OpenStreetMap) - Free geocoding & POI search, no API key needed
-const NOMINATIM_BASE = 'https://nominatim.openstreetmap.org';
+// Nominatim (OpenStreetMap) free geocoding - no API key needed
+const NOMINATIM_SEARCH_URL = 'https://nominatim.openstreetmap.org/search';
+const NOMINATIM_DETAILS_URL = 'https://nominatim.openstreetmap.org/details';
 
-interface PlaceResult {
+interface NominatimResult {
   place_id: number;
-  display_name: string;
+  licence: string;
+  osm_type: string;
+  osm_id: number;
   lat: string;
   lon: string;
+  display_name: string;
+  name?: string;
   type: string;
-  class: string;
-  importance: number;
-  address?: {
-    house_number?: string;
-    road?: string;
-    city?: string;
-    state?: string;
-    country?: string;
-    postcode?: string;
-    suburb?: string;
-  };
+  category: string;
+  address?: Record<string, string>;
   extratags?: Record<string, string>;
-  namedetails?: Record<string, string>;
+  bounded?: number;
+  icon?: string;
+  importance?: number;
 }
 
-export async function GET(req: Request) {
+export async function GET(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url);
     const query = searchParams.get('q');
-    const lat = searchParams.get('lat');
-    const lon = searchParams.get('lon');
-    const radius = searchParams.get('radius') || '5000'; // meters
-    const limit = searchParams.get('limit') || '20';
+    const limit = Math.min(parseInt(searchParams.get('limit') || '10'), 20);
+    const viewbox = searchParams.get('viewbox'); // "lon1,lat1,lon2,lat2"
+    const bounded = searchParams.get('bounded'); // 1 = restrict to viewbox
 
-    if (!query) {
-      return NextResponse.json({ error: 'Query parameter q is required' }, { status: 400 });
+    if (!query?.trim()) {
+      return NextResponse.json(
+        { error: 'Thiếu từ khóa tìm kiếm', places: [] },
+        { status: 400 }
+      );
     }
 
-    let results: PlaceResult[] = [];
+    // Build Nominatim search params
+    const params = new URLSearchParams({
+      q: query,
+      format: 'json',
+      addressdetails: '1',
+      extratags: '1',
+      namedetails: '0',
+      limit: limit.toString(),
+      'accept-language': 'vi,en',
+    });
 
-    if (lat && lon) {
-      // Search with bounded view for area-specific search
-      const delta = parseFloat(radius) / 111000; // rough km to degree conversion
-      const bbox = [
-        parseFloat(lon) - delta,
-        parseFloat(lat) - delta,
-        parseFloat(lon) + delta,
-        parseFloat(lat) + delta,
-      ];
-
-      const res = await fetch(
-        `${NOMINATIM_BASE}/search?format=json&q=${encodeURIComponent(query)}&viewbox=${bbox.join(',')}&bounded=0&limit=${limit}&addressdetails=1&extratags=1&namedetails=1&accept-language=vi`,
-        {
-          headers: {
-            'User-Agent': 'HermesSearchDashboard/1.0',
-          },
-          signal: AbortSignal.timeout(10000),
+    // Auto-detect city keywords for viewbox if not provided
+    if (!viewbox) {
+      const cityViewboxes: Record<string, string> = {
+        'hcm': '106.4,10.4,107.0,11.0',
+        'ho chi minh': '106.4,10.4,107.0,11.0',
+        'sai gon': '106.4,10.4,107.0,11.0',
+        'quan 1': '106.68,10.75,106.72,10.79',
+        'quan 2': '106.72,10.76,106.78,10.80',
+        'quan 3': '106.66,10.77,106.70,10.80',
+        'hà nội': '105.6,20.8,106.0,21.2',
+        'hanoi': '105.6,20.8,106.0,21.2',
+        'đà nẵng': '108.1,15.9,108.3,16.2',
+        'da nang': '108.1,15.9,108.3,16.2',
+      };
+      const queryLower = query.toLowerCase();
+      for (const [city, vb] of Object.entries(cityViewboxes)) {
+        if (queryLower.includes(city)) {
+          params.set('viewbox', vb);
+          params.set('bounded', '1');
+          break;
         }
-      );
-      results = await res.json();
-    } else {
-      // General search
-      const res = await fetch(
-        `${NOMINATIM_BASE}/search?format=json&q=${encodeURIComponent(query)}&limit=${limit}&addressdetails=1&extratags=1&namedetails=1&accept-language=vi&countrycodes=vn`,
-        {
-          headers: {
-            'User-Agent': 'HermesSearchDashboard/1.0',
-          },
-          signal: AbortSignal.timeout(10000),
-        }
-      );
-      results = await res.json();
-    }
-
-    // Also try Overpass API for POI search (shops, restaurants, businesses)
-    let overpassResults: any[] = [];
-    try {
-      if (lat && lon) {
-        const overpassQuery = `
-          [out:json][timeout:10];
-          (
-            node["name"~"${query}",i](around:${radius},${lat},${lon});
-            node["shop"~".*",i](around:${radius},${lat},${lon});
-            node["amenity"~".*",i](around:${radius},${lat},${lon});
-            node["office"~".*",i](around:${radius},${lat},${lon});
-          );
-          out body 10;
-        `;
-        const overpassRes = await fetch('https://overpass-api.de/api/interpreter', {
-          method: 'POST',
-          body: `data=${encodeURIComponent(overpassQuery)}`,
-          signal: AbortSignal.timeout(15000),
-        });
-        const overpassData = await overpassRes.json();
-        overpassResults = (overpassData.elements || []).filter(
-          (el: any) => el.tags?.name?.toLowerCase().includes(query.toLowerCase())
-        );
       }
-    } catch {
-      // Overpass might timeout, that's ok
+    } else {
+      params.set('viewbox', viewbox);
+      if (bounded) params.set('bounded', bounded);
     }
 
-    // Combine and format results
-    const formattedResults = [
-      ...results.map((r) => ({
-        id: r.place_id,
-        name: r.display_name.split(',')[0],
-        fullAddress: r.display_name,
-        lat: parseFloat(r.lat),
-        lon: parseFloat(r.lon),
-        type: r.type,
-        category: r.class,
-        importance: r.importance,
-        address: r.address,
-        tags: r.extratags || {},
-        phone: r.extratags?.phone || r.extratags?.['contact:phone'] || null,
-        website: r.extratags?.website || r.extratags?.['contact:website'] || null,
-        openingHours: r.extratags?.opening_hours || null,
-        source: 'nominatim',
-      })),
-      ...overpassResults.map((el: any) => ({
-        id: `overpass-${el.id}`,
-        name: el.tags?.name || 'Không tên',
-        fullAddress: `${el.tags?.['addr:street'] || ''} ${el.tags?.['addr:housenumber'] || ''}, ${el.tags?.['addr:city'] || ''}`.trim().replace(/^,|,$/g, ''),
-        lat: el.lat,
-        lon: el.lon,
-        type: el.tags?.shop || el.tags?.amenity || el.tags?.office || 'place',
-        category: el.tags?.shop ? 'shop' : el.tags?.amenity ? 'amenity' : el.tags?.office ? 'office' : 'place',
-        importance: 0.5,
-        address: {
-          road: el.tags?.['addr:street'],
-          house_number: el.tags?.['addr:housenumber'],
-          city: el.tags?.['addr:city'],
-          postcode: el.tags?.['addr:postcode'],
-        },
-        tags: el.tags || {},
-        phone: el.tags?.phone || el.tags?.['contact:phone'] || null,
-        website: el.tags?.website || el.tags?.['contact:website'] || null,
-        openingHours: el.tags?.opening_hours || null,
-        source: 'overpass',
-      })),
-    ];
+    // Add country codes bias for Vietnam
+    if (!params.has('countrycodes')) {
+      params.set('countrycodes', 'vn'); // Default to Vietnam, can be overridden
+    }
+
+    console.log(`[Places API] Searching Nominatim for: "${query}"`);
+
+    const searchResponse = await fetch(`${NOMINATIM_SEARCH_URL}?${params.toString()}`, {
+      headers: {
+        'User-Agent': 'HermesSmartSearch/1.0 (hermes-dashboard)',
+        'Accept-Language': 'vi,en',
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!searchResponse.ok) {
+      throw new Error(`Nominatim returned ${searchResponse.status}`);
+    }
+
+    const results: NominatimResult[] = await searchResponse.json();
+
+    // Transform results to our SearchPlace format
+    const places = results.map((r, idx) => ({
+      id: r.place_id || idx,
+      name: r.name || r.display_name?.split(',')[0] || 'Unknown',
+      fullAddress: r.display_name || '',
+      lat: parseFloat(r.lat),
+      lon: parseFloat(r.lon),
+      type: r.type || '',
+      category: r.category || '',
+      phone: r.extratags?.phone || r.extratags?.['contact:phone'] || null,
+      website: r.extratags?.website || r.extratags?.['contact:website'] || null,
+      openingHours: r.extratags?.opening_hours || r.extratags?.['opening_hours'] || null,
+    }));
+
+    // Filter out results without valid coordinates
+    const validPlaces = places.filter(p => !isNaN(p.lat) && !isNaN(p.lon));
+
+    console.log(`[Places API] Found ${validPlaces.length} places for "${query}"`);
 
     return NextResponse.json({
-      places: formattedResults,
+      places: validPlaces,
+      total: validPlaces.length,
       query,
-      count: formattedResults.length,
     });
   } catch (error: any) {
-    console.error('Places search error:', error);
-    return NextResponse.json(
-      { error: 'Lỗi tìm kiếm địa điểm', message: error.message, places: [] },
-      { status: 500 }
-    );
+    console.error('[Places API] Error:', error.message);
+
+    // Fallback: try Overpass API for more detailed POI search
+    try {
+      const { searchParams } = new URL(req.url);
+      const query = searchParams.get('q');
+      if (!query) throw new Error('No query');
+
+      const overpassPlaces = await searchOverpass(query);
+      return NextResponse.json({
+        places: overpassPlaces,
+        total: overpassPlaces.length,
+        query,
+      });
+    } catch (fallbackError: any) {
+      return NextResponse.json(
+        {
+          error: 'Không thể tìm kiếm địa điểm',
+          message: fallbackError.message,
+          places: [],
+          total: 0,
+          query: searchParams?.get('q') || '',
+        },
+        { status: 500 }
+      );
+    }
   }
+}
+
+// Overpass API fallback for more detailed POI data (shops, restaurants, etc.)
+async function searchOverpass(query: string): Promise<any[]> {
+  const OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
+
+  // Build Overpass QL query
+  const encodedQuery = encodeURIComponent(query);
+  const overpassQuery = `
+    [out:json][timeout:15];
+    (
+      node["name"~"${query}",i]({{bbox}});
+      way["name"~"${query}",i]({{bbox}});
+      node["shop"~"${query}",i]({{bbox}});
+      node["amenity"~"${query}",i]({{bbox}});
+      node["office"~"${query}",i]({{bbox}});
+    );
+    out center body 10;
+  `;
+
+  // Use a Vietnam bounding box as default
+  const vietnamBbox = '8.0,102.0,24.0,110.0';
+  const finalQuery = overpassQuery.replace(/\{\{bbox\}\}/g, vietnamBbox);
+
+  const response = await fetch(`${OVERPASS_URL}?data=${encodeURIComponent(finalQuery)}`, {
+    signal: AbortSignal.timeout(15000),
+    headers: {
+      'User-Agent': 'HermesSmartSearch/1.0',
+    },
+  });
+
+  if (!response.ok) throw new Error(`Overpass returned ${response.status}`);
+
+  const data = await response.json();
+
+  return (data.elements || [])
+    .filter((el: any) => el.lat || el.center?.lat)
+    .map((el: any, idx: number) => ({
+      id: el.id || idx,
+      name: el.tags?.name || query,
+      fullAddress: [
+        el.tags?.['addr:street'],
+        el.tags?.['addr:city'],
+        el.tags?.['addr:state'],
+        el.tags?.['addr:country'] || 'Việt Nam',
+      ].filter(Boolean).join(', ') || 'Không có địa chỉ chi tiết',
+      lat: el.lat || el.center?.lat || 0,
+      lon: el.lon || el.center?.lon || 0,
+      type: el.tags?.shop || el.tags?.amenity || el.tags?.office || '',
+      category: el.tags?.shop ? 'shop' : el.tags?.amenity ? 'amenity' : el.tags?.office ? 'office' : 'place',
+      phone: el.tags?.phone || el.tags?.['contact:phone'] || null,
+      website: el.tags?.website || el.tags?.['contact:website'] || null,
+      openingHours: el.tags?.opening_hours || null,
+    }))
+    .filter((p: any) => p.lat !== 0 && p.lon !== 0);
 }

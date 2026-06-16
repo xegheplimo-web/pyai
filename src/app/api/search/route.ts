@@ -1,134 +1,332 @@
-import { NextResponse } from 'next/server';
-import ZAI from 'z-ai-web-dev-sdk';
+import { NextRequest, NextResponse } from 'next/server';
 import { createOpenAI } from '@ai-sdk/openai';
 import { generateText } from 'ai';
 
+// Qwen provider for AI synthesis
 const qwen = createOpenAI({
   baseURL: process.env.QWEN_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1',
   apiKey: process.env.QWEN_API_KEY || '',
 });
 
-export const maxDuration = 60;
-
-interface SearchResult {
+interface SearchSource {
+  id: number;
   url: string;
   name: string;
   snippet: string;
-  host_name: string;
-  rank: number;
+  host_name?: string;
   date?: string;
 }
 
-export async function POST(req: Request) {
+interface SearchPlace {
+  id: number | string;
+  name: string;
+  fullAddress: string;
+  lat: number;
+  lon: number;
+  type?: string;
+  category?: string;
+  phone?: string | null;
+  website?: string | null;
+  openingHours?: string | null;
+}
+
+export async function POST(req: NextRequest) {
   try {
-    const { query, searchDepth = 'standard' } = await req.json();
+    const { query, location } = await req.json();
 
     if (!query?.trim()) {
-      return NextResponse.json({ error: 'Query is required' }, { status: 400 });
-    }
-
-    // Step 1: Web search using z-ai-web-dev-sdk
-    const zai = await ZAI.create();
-    const searchResults: SearchResult[] = await zai.functions.invoke('web_search', {
-      query: query,
-      num: 10,
-    });
-
-    if (!searchResults || searchResults.length === 0) {
-      return NextResponse.json({
-        answer: 'Không tìm thấy kết quả cho truy vấn này.',
-        sources: [],
-        query,
-      });
-    }
-
-    // Step 2: Read top pages sequentially to avoid rate limiting
-    const topResults = searchResults.slice(0, 5);
-    const pageContents: { url: string; name: string; content: string }[] = [];
-
-    // Process 2 at a time with delay to avoid 429 rate limiting
-    for (let i = 0; i < topResults.length; i += 2) {
-      const batch = topResults.slice(i, i + 2);
-      const batchResults = await Promise.all(
-        batch.map(async (result) => {
-          try {
-            const pageData = await zai.functions.invoke('web_reader', {
-              url: result.url,
-            });
-            if (pageData?.html) {
-              const plainText = pageData.html
-                .replace(/<[^>]*>/g, ' ')
-                .replace(/\s+/g, ' ')
-                .trim()
-                .slice(0, 3000);
-              return {
-                url: result.url,
-                name: result.name || result.host_name,
-                content: plainText,
-              };
-            }
-          } catch {
-            // Skip pages that fail to read
-          }
-          return null;
-        })
+      return NextResponse.json(
+        { error: 'Thiếu từ khóa tìm kiếm', answer: '', sources: [], places: [] },
+        { status: 400 }
       );
-      pageContents.push(...batchResults.filter(Boolean) as { url: string; name: string; content: string }[]);
-      // Small delay between batches
-      if (i + 2 < topResults.length) {
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
     }
 
-    // Step 3: AI synthesis using Qwen 3.5 Flash
-    const sourcesText = pageContents
-      .map((p, i) => `[Source ${i + 1}: ${p.name}](${p.url})\n${p.content}`)
-      .join('\n\n---\n\n');
+    console.log(`[Smart Search] Searching for: "${query}"`);
 
-    const synthesisPrompt = `Bạn là trợ lý tìm kiếm thông minh giống Perplexity AI. Dựa trên các nguồn thông tin dưới đây, hãy trả lời câu hỏi của người dùng một cách chi tiết, chính xác và có trích dẫn nguồn.
+    // Step 1: Detect query intent (is it location-related?)
+    const isLocationQuery = detectLocationIntent(query);
 
-QUY TẮC:
-1. Trả lời bằng tiếng Việt nếu câu hỏi bằng tiếng Việt
-2. Trích dẫn nguồn bằng format [Source X] khi sử dụng thông tin từ nguồn đó
-3. Cấu trúc trả lời rõ ràng với heading, bullet points
-4. Nếu thông tin không đủ, hãy nói rõ
-5. Bao gồm thông tin cụ thể như địa chỉ, số điện thoại, giờ mở cửa nếu có
+    // Step 2: Parallel search - web + places (if location-related)
+    const [webSources, places] = await Promise.all([
+      searchWeb(query),
+      isLocationQuery ? searchPlaces(query, location) : Promise.resolve([]),
+    ]);
 
-CÂU HỎI: ${query}
+    console.log(`[Smart Search] Web: ${webSources.length} sources, Places: ${places.length}`);
 
-NGUỒN THÔNG TIN:
-${sourcesText}
+    // Step 3: Read top web pages for detailed content
+    const pageContents = await readWebPages(webSources.slice(0, 4));
+    console.log(`[Smart Search] Read ${pageContents.length} pages`);
 
-Hãy tổng hợp thông tin và trả lời:`;
-
-    const { text: answer } = await generateText({
-      model: qwen('qwen3.5-flash'),
-      prompt: synthesisPrompt,
-      maxTokens: 2000,
-    });
+    // Step 4: AI synthesis
+    const answer = await synthesizeAnswer(query, webSources, places, pageContents);
 
     return NextResponse.json({
       answer,
-      sources: searchResults.map((r, i) => ({
-        id: i + 1,
-        url: r.url,
-        name: r.name || r.host_name,
-        snippet: r.snippet,
-        host_name: r.host_name,
-        date: r.date,
-      })),
+      sources: webSources,
+      places,
       query,
-      pageContents: pageContents.map((p, i) => ({
-        url: p.url,
-        name: p.name,
-        contentLength: p.content.length,
-      })),
     });
   } catch (error: any) {
-    console.error('Search API error:', error);
+    console.error('[Smart Search] Error:', error);
     return NextResponse.json(
-      { error: 'Lỗi tìm kiếm', message: error.message },
+      {
+        error: 'Lỗi tìm kiếm',
+        message: error.message,
+        answer: 'Không thể tìm kiếm lúc này. Vui lòng thử lại sau.',
+        sources: [],
+        places: [],
+      },
       { status: 500 }
     );
+  }
+}
+
+// Detect if the query is location/place related
+function detectLocationIntent(query: string): boolean {
+  const locationKeywords = [
+    'ở đâu', 'tại', 'địa chỉ', 'vị trí', 'cửa hàng', 'nhà hàng', 'quán',
+    'phòng khám', 'bệnh viện', 'trường', 'chợ', 'siêu thị', 'ngân hàng',
+    'công ty', 'văn phòng', 'địa điểm', 'bản đồ', 'gần', 'quận', 'phường',
+    'thành phố', 'tỉnh', 'đường', 'store', 'shop', 'restaurant', 'cafe',
+    'hospital', 'clinic', 'bank', 'school', 'market', 'near', 'location',
+    'map', 'address', 'where', 'place',
+  ];
+
+  const queryLower = query.toLowerCase();
+  return locationKeywords.some(kw => queryLower.includes(kw));
+}
+
+// Web search using z-ai-web-dev-sdk
+async function searchWeb(query: string): Promise<SearchSource[]> {
+  try {
+    const { default: ZAI } = await import('z-ai-web-dev-sdk');
+    const zai = await ZAI.create();
+
+    const searchResult = await zai.functions.invoke('web_search', {
+      query,
+      num: 10,
+    });
+
+    if (Array.isArray(searchResult)) {
+      return searchResult.map((item: any, idx: number) => ({
+        id: idx + 1,
+        url: item.url || '',
+        name: item.name || '',
+        snippet: item.snippet || '',
+        host_name: item.host_name || '',
+        date: item.date || '',
+      }));
+    }
+
+    return [];
+  } catch (error: any) {
+    console.error('[Smart Search] z-ai web search error:', error.message);
+
+    // Fallback to DuckDuckGo
+    try {
+      return await searchDuckDuckGo(query);
+    } catch {
+      return [];
+    }
+  }
+}
+
+// Fallback: DuckDuckGo HTML search
+async function searchDuckDuckGo(query: string): Promise<SearchSource[]> {
+  const searchQuery = encodeURIComponent(query);
+  const url = `https://html.duckduckgo.com/html/?q=${searchQuery}`;
+
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+    },
+    signal: AbortSignal.timeout(10000),
+  });
+
+  const html = await response.text();
+  const sources: SearchSource[] = [];
+
+  const resultRegex = /<a rel="nofollow" class="result__a" href="([^"]+)">(.*?)<\/a>.*?<a class="result__snippet".*?>(.*?)<\/a>/gs;
+  let match;
+  let idx = 0;
+
+  while ((match = resultRegex.exec(html)) !== null && idx < 8) {
+    const resultUrl = match[1];
+    const name = match[2].replace(/<[^>]*>/g, '').trim();
+    const snippet = match[3].replace(/<[^>]*>/g, '').trim();
+
+    if (resultUrl && name) {
+      try {
+        const parsed = new URL(resultUrl);
+        sources.push({
+          id: idx + 1,
+          url: resultUrl,
+          name,
+          snippet,
+          host_name: parsed.hostname,
+        });
+        idx++;
+      } catch {}
+    }
+  }
+
+  return sources;
+}
+
+// Search places using Nominatim (OpenStreetMap)
+async function searchPlaces(query: string, location?: string): Promise<SearchPlace[]> {
+  try {
+    const searchQuery = location ? `${query} ${location}` : `${query} Việt Nam`;
+    const params = new URLSearchParams({
+      q: searchQuery,
+      format: 'json',
+      addressdetails: '1',
+      extratags: '1',
+      limit: '10',
+      'accept-language': 'vi,en',
+      countrycodes: 'vn',
+    });
+
+    // Add viewbox for major cities
+    const cityViewboxes: Record<string, string> = {
+      'hcm': '106.4,10.4,107.0,11.0',
+      'ho chi minh': '106.4,10.4,107.0,11.0',
+      'sai gon': '106.4,10.4,107.0,11.0',
+      'quan 1': '106.68,10.75,106.72,10.79',
+      'hà nội': '105.6,20.8,106.0,21.2',
+      'hanoi': '105.6,20.8,106.0,21.2',
+      'đà nẵng': '108.1,15.9,108.3,16.2',
+      'da nang': '108.1,15.9,108.3,16.2',
+    };
+
+    const locLower = (location || '').toLowerCase() + ' ' + query.toLowerCase();
+    for (const [city, viewbox] of Object.entries(cityViewboxes)) {
+      if (locLower.includes(city)) {
+        params.set('viewbox', viewbox);
+        params.set('bounded', '1');
+        break;
+      }
+    }
+
+    const response = await fetch(`https://nominatim.openstreetmap.org/search?${params}`, {
+      headers: {
+        'User-Agent': 'HermesSmartSearch/1.0',
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (!response.ok) return [];
+
+    const results = await response.json();
+
+    return results
+      .map((r: any, idx: number) => ({
+        id: r.place_id || idx,
+        name: r.name || r.display_name?.split(',')[0] || '',
+        fullAddress: r.display_name || '',
+        lat: parseFloat(r.lat),
+        lon: parseFloat(r.lon),
+        type: r.type || '',
+        category: r.category || '',
+        phone: r.extratags?.phone || null,
+        website: r.extratags?.website || null,
+        openingHours: r.extratags?.opening_hours || null,
+      }))
+      .filter((p: SearchPlace) => !isNaN(p.lat) && !isNaN(p.lon) && p.lat !== 0);
+  } catch (error: any) {
+    console.error('[Smart Search] Places error:', error.message);
+    return [];
+  }
+}
+
+// Read web pages for detailed content
+async function readWebPages(sources: SearchSource[]): Promise<string[]> {
+  const contents: string[] = [];
+
+  for (const source of sources.slice(0, 3)) {
+    try {
+      const { default: ZAI } = await import('z-ai-web-dev-sdk');
+      const zai = await ZAI.create();
+
+      const result = await zai.functions.invoke('web_reader', {
+        url: source.url,
+      });
+
+      if (result?.html || result?.content) {
+        const content = result.content || result.html;
+        contents.push(
+          `Source: ${source.name} (${source.url})\n${typeof content === 'string' ? content.slice(0, 3000) : JSON.stringify(content).slice(0, 3000)}`
+        );
+      }
+    } catch {
+      // Skip failed reads
+    }
+  }
+
+  return contents;
+}
+
+// AI synthesis using Qwen 3.5 Flash
+async function synthesizeAnswer(
+  query: string,
+  sources: SearchSource[],
+  places: SearchPlace[],
+  pageContents: string[]
+): Promise<string> {
+  try {
+    const sourcesContext = sources
+      .slice(0, 8)
+      .map(s => `[${s.id}] ${s.name}: ${s.snippet}`)
+      .join('\n');
+
+    const placesContext = places.length > 0
+      ? places.slice(0, 8).map(p => {
+          let info = `- ${p.name} (${p.type || 'địa điểm'}): ${p.fullAddress}`;
+          if (p.phone) info += ` | ĐT: ${p.phone}`;
+          if (p.openingHours) info += ` | Giờ: ${p.openingHours}`;
+          return info;
+        }).join('\n')
+      : '';
+
+    const pageContext = pageContents.join('\n\n---\n\n');
+
+    const prompt = `Bạn là trợ lý tìm kiếm thông minh kiểu Perplexity AI. Hãy tổng hợp thông tin từ nhiều nguồn để trả lời câu hỏi một cách chi tiết, chính xác và có trích dẫn nguồn.
+
+Câu hỏi: "${query}"
+
+Kết quả tìm kiếm web:
+${sourcesContext || 'Không có nguồn web'}
+
+${placesContext ? `Địa điểm trên bản đồ:\n${placesContext}` : ''}
+
+${pageContext ? `Nội dung chi tiết từ trang web:\n${pageContext}` : ''}
+
+Yêu cầu:
+1. Trả lời chi tiết, có cấu trúc rõ ràng (sử dụng bullet points, đánh số)
+2. Trích dẫn nguồn bằng số [1], [2], ... tương ứng với nguồn tìm kiếm
+3. Nếu có thông tin địa điểm, liệt kê rõ tên, địa chỉ, liên hệ
+4. Thêm thông tin bổ sung hữu ích nếu có
+5. Trả lời bằng tiếng Việt
+6. Nếu thông tin không đủ, đề xuất cách tìm thêm`;
+
+    const result = await generateText({
+      model: qwen('qwen3.5-flash'),
+      prompt,
+      maxTokens: 2048,
+    });
+
+    return result.text || 'Không thể tổng hợp thông tin. Vui lòng xem các nguồn tham khảo.';
+  } catch (error: any) {
+    console.error('[Smart Search] AI synthesis error:', error.message);
+
+    // Fallback: basic answer from sources
+    if (sources.length > 0) {
+      return sources.slice(0, 6).map(s =>
+        `[${s.id}] **${s.name}**: ${s.snippet}`
+      ).join('\n\n');
+    }
+
+    return 'Không tìm thấy kết quả phù hợp.';
   }
 }
