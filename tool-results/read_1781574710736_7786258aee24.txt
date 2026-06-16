@@ -1,0 +1,1292 @@
+     1→"""ACP tool-call helpers for mapping hermes tools to ACP ToolKind and building content."""
+     2→
+     3→from __future__ import annotations
+     4→
+     5→import json
+     6→import uuid
+     7→from typing import Any, Dict, List, Optional
+     8→
+     9→import acp
+    10→from acp.schema import (
+    11→    ToolCallLocation,
+    12→    ToolCallStart,
+    13→    ToolCallProgress,
+    14→    ToolKind,
+    15→)
+    16→
+    17→# ---------------------------------------------------------------------------
+    18→# Map hermes tool names -> ACP ToolKind
+    19→# ---------------------------------------------------------------------------
+    20→
+    21→TOOL_KIND_MAP: Dict[str, ToolKind] = {
+    22→    # File operations
+    23→    "read_file": "read",
+    24→    "write_file": "edit",
+    25→    "patch": "edit",
+    26→    "search_files": "search",
+    27→    # Terminal / execution
+    28→    "terminal": "execute",
+    29→    "process": "execute",
+    30→    "execute_code": "execute",
+    31→    # Session/meta tools
+    32→    "todo": "other",
+    33→    "skill_view": "read",
+    34→    "skills_list": "read",
+    35→    "skill_manage": "edit",
+    36→    # Web / fetch
+    37→    "web_search": "fetch",
+    38→    "web_extract": "fetch",
+    39→    # Browser
+    40→    "browser_navigate": "fetch",
+    41→    "browser_click": "execute",
+    42→    "browser_type": "execute",
+    43→    "browser_snapshot": "read",
+    44→    "browser_vision": "read",
+    45→    "browser_scroll": "execute",
+    46→    "browser_press": "execute",
+    47→    "browser_back": "execute",
+    48→    "browser_get_images": "read",
+    49→    # Agent internals
+    50→    "delegate_task": "execute",
+    51→    "vision_analyze": "read",
+    52→    "image_generate": "execute",
+    53→    "text_to_speech": "execute",
+    54→    # Thinking / meta
+    55→    "_thinking": "think",
+    56→}
+    57→
+    58→
+    59→_POLISHED_TOOLS = {
+    60→    # Core operator loop
+    61→    "todo", "memory", "session_search", "delegate_task",
+    62→    # Files / execution
+    63→    "read_file", "write_file", "patch", "search_files", "terminal", "process", "execute_code",
+    64→    # Skills / web / browser / media
+    65→    "skill_view", "skills_list", "skill_manage", "web_search", "web_extract",
+    66→    "browser_navigate", "browser_click", "browser_type", "browser_press", "browser_scroll",
+    67→    "browser_back", "browser_snapshot", "browser_console", "browser_get_images", "browser_vision",
+    68→    "vision_analyze", "image_generate", "text_to_speech",
+    69→    # Schedulers / platform integrations
+    70→    "cronjob", "send_message", "clarify", "discord", "discord_admin",
+    71→    "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    72→    "feishu_doc_read", "feishu_drive_list_comments", "feishu_drive_list_comment_replies",
+    73→    "feishu_drive_reply_comment", "feishu_drive_add_comment",
+    74→    "kanban_create", "kanban_show", "kanban_comment", "kanban_complete",
+    75→    "kanban_block", "kanban_link", "kanban_heartbeat",
+    76→    "yb_query_group_info", "yb_query_group_members", "yb_search_sticker",
+    77→    "yb_send_dm", "yb_send_sticker", "mixture_of_agents",
+    78→}
+    79→
+    80→
+    81→def get_tool_kind(tool_name: str) -> ToolKind:
+    82→    """Return the ACP ToolKind for a hermes tool, defaulting to 'other'."""
+    83→    return TOOL_KIND_MAP.get(tool_name, "other")
+    84→
+    85→
+    86→def make_tool_call_id() -> str:
+    87→    """Generate a unique tool call ID."""
+    88→    return f"tc-{uuid.uuid4().hex[:12]}"
+    89→
+    90→
+    91→def build_tool_title(tool_name: str, args: Dict[str, Any]) -> str:
+    92→    """Build a human-readable title for a tool call."""
+    93→    if tool_name == "terminal":
+    94→        cmd = args.get("command", "")
+    95→        if len(cmd) > 80:
+    96→            cmd = cmd[:77] + "..."
+    97→        return f"terminal: {cmd}"
+    98→    if tool_name == "read_file":
+    99→        return f"read: {args.get('path', '?')}"
+   100→    if tool_name == "write_file":
+   101→        return f"write: {args.get('path', '?')}"
+   102→    if tool_name == "patch":
+   103→        mode = args.get("mode", "replace")
+   104→        path = args.get("path", "?")
+   105→        return f"patch ({mode}): {path}"
+   106→    if tool_name == "search_files":
+   107→        return f"search: {args.get('pattern', '?')}"
+   108→    if tool_name == "web_search":
+   109→        return f"web search: {args.get('query', '?')}"
+   110→    if tool_name == "web_extract":
+   111→        urls = args.get("urls", [])
+   112→        if urls:
+   113→            return f"extract: {urls[0]}" + (f" (+{len(urls)-1})" if len(urls) > 1 else "")
+   114→        return "web extract"
+   115→    if tool_name == "process":
+   116→        action = str(args.get("action") or "").strip() or "manage"
+   117→        sid = str(args.get("session_id") or "").strip()
+   118→        return f"process {action}: {sid}" if sid else f"process {action}"
+   119→    if tool_name == "delegate_task":
+   120→        tasks = args.get("tasks")
+   121→        if isinstance(tasks, list) and tasks:
+   122→            return f"delegate batch ({len(tasks)} tasks)"
+   123→        goal = args.get("goal", "")
+   124→        if goal and len(goal) > 60:
+   125→            goal = goal[:57] + "..."
+   126→        return f"delegate: {goal}" if goal else "delegate task"
+   127→    if tool_name == "session_search":
+   128→        query = str(args.get("query") or "").strip()
+   129→        return f"session search: {query}" if query else "recent sessions"
+   130→    if tool_name == "memory":
+   131→        action = str(args.get("action") or "manage").strip() or "manage"
+   132→        target = str(args.get("target") or "memory").strip() or "memory"
+   133→        return f"memory {action}: {target}"
+   134→    if tool_name == "execute_code":
+   135→        code = str(args.get("code") or "").strip()
+   136→        first_line = next((line.strip() for line in code.splitlines() if line.strip()), "")
+   137→        if first_line:
+   138→            if len(first_line) > 70:
+   139→                first_line = first_line[:67] + "..."
+   140→            return f"python: {first_line}"
+   141→        return "python code"
+   142→    if tool_name == "todo":
+   143→        items = args.get("todos")
+   144→        if isinstance(items, list):
+   145→            return f"todo ({len(items)} item{'s' if len(items) != 1 else ''})"
+   146→        return "todo"
+   147→    if tool_name == "skill_view":
+   148→        name = str(args.get("name") or "?").strip() or "?"
+   149→        file_path = str(args.get("file_path") or "").strip()
+   150→        suffix = f"/{file_path}" if file_path else ""
+   151→        return f"skill view ({name}{suffix})"
+   152→    if tool_name == "skills_list":
+   153→        category = str(args.get("category") or "").strip()
+   154→        return f"skills list ({category})" if category else "skills list"
+   155→    if tool_name == "skill_manage":
+   156→        action = str(args.get("action") or "manage").strip() or "manage"
+   157→        name = str(args.get("name") or "?").strip() or "?"
+   158→        file_path = str(args.get("file_path") or "").strip()
+   159→        target = f"{name}/{file_path}" if file_path else name
+   160→        if len(target) > 64:
+   161→            target = target[:61] + "..."
+   162→        return f"skill {action}: {target}"
+   163→    if tool_name == "browser_navigate":
+   164→        return f"navigate: {args.get('url', '?')}"
+   165→    if tool_name == "browser_snapshot":
+   166→        return "browser snapshot"
+   167→    if tool_name == "browser_vision":
+   168→        return f"browser vision: {str(args.get('question', '?'))[:50]}"
+   169→    if tool_name == "browser_get_images":
+   170→        return "browser images"
+   171→    if tool_name == "vision_analyze":
+   172→        return f"analyze image: {str(args.get('question', '?'))[:50]}"
+   173→    if tool_name == "image_generate":
+   174→        prompt = str(args.get("prompt") or args.get("description") or "").strip()
+   175→        return f"generate image: {prompt[:50]}" if prompt else "generate image"
+   176→    if tool_name == "cronjob":
+   177→        action = str(args.get("action") or "manage").strip() or "manage"
+   178→        job_id = str(args.get("job_id") or args.get("id") or "").strip()
+   179→        return f"cron {action}: {job_id}" if job_id else f"cron {action}"
+   180→    return tool_name
+   181→
+   182→
+   183→def _text(content: str) -> Any:
+   184→    return acp.tool_content(acp.text_block(content))
+   185→
+   186→
+   187→def _json_loads_maybe(value: Optional[str]) -> Any:
+   188→    if not isinstance(value, str):
+   189→        return value
+   190→    try:
+   191→        return json.loads(value)
+   192→    except Exception:
+   193→        pass
+   194→
+   195→    # Some Hermes tools append a human hint after a JSON payload, e.g.
+   196→    # ``{...}\n\n[Hint: Results truncated...]``. Keep the structured rendering path
+   197→    # by decoding the first JSON value instead of falling back to raw text.
+   198→    try:
+   199→        decoded, _ = json.JSONDecoder().raw_decode(value.lstrip())
+   200→        return decoded
+   201→    except Exception:
+   202→        return None
+   203→
+   204→
+   205→def _tool_result_failed(result: Optional[str], tool_name: str | None = None) -> bool:
+   206→    """Return True when a structured Hermes tool result clearly failed.
+   207→
+   208→    Keep this deliberately conservative. Plain text can contain words like
+   209→    "error" because tests failed or a command printed diagnostics; Zed should
+   210→    only receive ACP failed status for structured tool-level failures.
+   211→    """
+   212→    # Raised exceptions from the agent's tool executor get wrapped in a
+   213→    # canonical "Error executing tool '<name>': ..." prefix (see
+   214→    # agent/tool_executor.py around the try/except). That prefix is uniquely
+   215→    # produced by the wrapper itself — it cannot legitimately appear in
+   216→    # well-behaved tool output. Catch it so a tool that blew up shows as
+   217→    # failed in Zed instead of misleadingly green.
+   218→    if isinstance(result, str) and result.startswith("Error executing tool '"):
+   219→        return True
+   220→
+   221→    data = _json_loads_maybe(result)
+   222→    if not isinstance(data, dict):
+   223→        return False
+   224→
+   225→    for key in ("success", "ok"):
+   226→        if data.get(key) is False:
+   227→            return True
+   228→
+   229→    exit_code = data.get("exit_code", data.get("returncode"))
+   230→    if isinstance(exit_code, int) and exit_code != 0:
+   231→        return True
+   232→
+   233→    # Hermes core/polished tools commonly report tool-level failures as a
+   234→    # structured {"error": "..."} payload without an explicit success flag.
+   235→    # Keep generic plugin/unknown tool payloads conservative to avoid marking
+   236→    # optional diagnostic messages as failed.
+   237→    if tool_name in _POLISHED_TOOLS and data.get("error") and not data.get("content"):
+   238→        return True
+   239→
+   240→    return False
+   241→
+   242→
+   243→def _truncate_text(text: str, limit: int = 5000) -> str:
+   244→    if len(text) <= limit:
+   245→        return text
+   246→    return text[: max(0, limit - 100)] + f"\n... ({len(text)} chars total, truncated)"
+   247→
+   248→
+   249→def _fenced_text(text: str, language: str = "") -> str:
+   250→    """Return a Markdown fence that cannot be broken by backticks in text."""
+   251→    longest = max((len(run) for run in text.split("`")[1::2]), default=0)
+   252→    fence = "`" * max(3, longest + 1)
+   253→    return f"{fence}{language}\n{text}\n{fence}"
+   254→
+   255→
+   256→def _format_todo_result(result: Optional[str]) -> Optional[str]:
+   257→    data = _json_loads_maybe(result)
+   258→    if not isinstance(data, dict) or not isinstance(data.get("todos"), list):
+   259→        return None
+   260→    summary = data.get("summary") if isinstance(data.get("summary"), dict) else {}
+   261→    icon = {
+   262→        "completed": "✅",
+   263→        "in_progress": "🔄",
+   264→        "pending": "⏳",
+   265→        "cancelled": "✗",
+   266→    }
+   267→    lines = ["**Todo list**", ""]
+   268→    for item in data["todos"]:
+   269→        if not isinstance(item, dict):
+   270→            continue
+   271→        status = str(item.get("status") or "pending")
+   272→        content = str(item.get("content") or item.get("id") or "").strip()
+   273→        if content:
+   274→            lines.append(f"- {icon.get(status, '•')} {content}")
+   275→    if summary:
+   276→        cancelled = summary.get("cancelled", 0)
+   277→        lines.extend([
+   278→            "",
+   279→            "**Progress:** "
+   280→            f"{summary.get('completed', 0)} completed, "
+   281→            f"{summary.get('in_progress', 0)} in progress, "
+   282→            f"{summary.get('pending', 0)} pending"
+   283→            + (f", {cancelled} cancelled" if cancelled else ""),
+   284→        ])
+   285→    return "\n".join(lines)
+   286→
+   287→
+   288→def _format_read_file_result(result: Optional[str], args: Optional[Dict[str, Any]]) -> Optional[str]:
+   289→    data = _json_loads_maybe(result)
+   290→    if not isinstance(data, dict):
+   291→        return None
+   292→    if data.get("error") and not data.get("content"):
+   293→        return f"Read failed: {data.get('error')}"
+   294→    content = data.get("content")
+   295→    if not isinstance(content, str):
+   296→        return None
+   297→    path = str((args or {}).get("path") or data.get("path") or "file").strip()
+   298→    offset = (args or {}).get("offset")
+   299→    limit = (args or {}).get("limit")
+   300→    range_bits = []
+   301→    if offset:
+   302→        range_bits.append(f"from line {offset}")
+   303→    if limit:
+   304→        range_bits.append(f"limit {limit}")
+   305→    suffix = f" ({', '.join(range_bits)})" if range_bits else ""
+   306→    header = f"Read {path}{suffix}"
+   307→    if data.get("total_lines") is not None:
+   308→        header += f" — {data.get('total_lines')} total lines"
+   309→    # Hermes read_file output is line-numbered with `|`. If we send it as raw
+   310→    # Markdown, Zed can interpret pipes as tables and collapse the layout.
+   311→    # Fence the payload so file lines stay readable and literal.
+   312→    return _truncate_text(f"{header}\n\n{_fenced_text(content)}")
+   313→
+   314→
+   315→def _format_search_files_result(result: Optional[str]) -> Optional[str]:
+   316→    data = _json_loads_maybe(result)
+   317→    if not isinstance(data, dict):
+   318→        return None
+   319→
+   320→    files = data.get("files")
+   321→    if isinstance(files, list):
+   322→        total = data.get("total_count", len(files))
+   323→        shown = min(len(files), 20)
+   324→        truncated = bool(data.get("truncated")) or len(files) > shown
+   325→        lines = [
+   326→            "File search results",
+   327→            f"Found {total} file{'s' if total != 1 else ''}; showing {shown}.",
+   328→            "",
+   329→        ]
+   330→        for path in files[:shown]:
+   331→            lines.append(f"- {path}")
+   332→        if truncated:
+   333→            lines.extend([
+   334→                "",
+   335→                "Results truncated. Narrow the search, add path/file_glob, or use offset to page.",
+   336→            ])
+   337→        return _truncate_text("\n".join(lines), limit=7000)
+   338→
+   339→    matches = data.get("matches")
+   340→    if not isinstance(matches, list):
+   341→        return None
+   342→
+   343→    total = data.get("total_count", len(matches))
+   344→    shown = min(len(matches), 12)
+   345→    truncated = bool(data.get("truncated")) or len(matches) > shown
+   346→    lines = [
+   347→        "Search results",
+   348→        f"Found {total} match{'es' if total != 1 else ''}; showing {shown}.",
+   349→        "",
+   350→    ]
+   351→
+   352→    for match in matches[:shown]:
+   353→        if not isinstance(match, dict):
+   354→            lines.append(f"- {match}")
+   355→            continue
+   356→
+   357→        path = str(match.get("path") or match.get("file") or match.get("filename") or "?")
+   358→        line = match.get("line") or match.get("line_number")
+   359→        content = str(match.get("content") or match.get("text") or "").strip()
+   360→        loc = f"{path}:{line}" if line else path
+   361→        lines.append(f"- {loc}")
+   362→        if content:
+   363→            snippet = _truncate_text(" ".join(content.split()), 300)
+   364→            lines.append(f"  {snippet}")
+   365→
+   366→    if truncated:
+   367→        lines.extend([
+   368→            "",
+   369→            "Results truncated. Narrow the search, add file_glob, or use offset to page.",
+   370→        ])
+   371→    return _truncate_text("\n".join(lines), limit=7000)
+   372→
+   373→
+   374→def _format_execute_code_result(result: Optional[str]) -> Optional[str]:
+   375→    data = _json_loads_maybe(result)
+   376→    if not isinstance(data, dict):
+   377→        return result if isinstance(result, str) and result.strip() else None
+   378→    output = str(data.get("output") or "")
+   379→    error = str(data.get("error") or "")
+   380→    exit_code = data.get("exit_code")
+   381→    parts = [f"Exit code: {exit_code}" if exit_code is not None else "Execution complete"]
+   382→    if output:
+   383→        parts.extend(["", "Output:", output])
+   384→    if error:
+   385→        parts.extend(["", "Error:", error])
+   386→    return _truncate_text("\n".join(parts))
+   387→
+   388→
+   389→def _extract_markdown_headings(content: str, limit: int = 8) -> list[str]:
+   390→    headings: list[str] = []
+   391→    for line in content.splitlines():
+   392→        stripped = line.strip()
+   393→        if stripped.startswith("#"):
+   394→            heading = stripped.lstrip("#").strip()
+   395→            if heading:
+   396→                headings.append(heading)
+   397→        if len(headings) >= limit:
+   398→            break
+   399→    return headings
+   400→
+   401→
+   402→def _format_skill_view_result(result: Optional[str]) -> Optional[str]:
+   403→    data = _json_loads_maybe(result)
+   404→    if not isinstance(data, dict):
+   405→        return None
+   406→    if data.get("success") is False:
+   407→        return f"Skill view failed: {data.get('error', 'unknown error')}"
+   408→    name = str(data.get("name") or "skill")
+   409→    file_path = str(data.get("file") or data.get("path") or "SKILL.md")
+   410→    description = str(data.get("description") or "").strip()
+   411→    content = str(data.get("content") or "")
+   412→    linked = data.get("linked_files") if isinstance(data.get("linked_files"), dict) else None
+   413→
+   414→    lines = ["**Skill loaded**", "", f"- **Name:** `{name}`", f"- **File:** `{file_path}`"]
+   415→    if description:
+   416→        lines.append(f"- **Description:** {description}")
+   417→    if content:
+   418→        lines.append(f"- **Content:** {len(content):,} chars loaded into agent context")
+   419→    if linked:
+   420→        linked_count = sum(len(v) for v in linked.values() if isinstance(v, list))
+   421→        lines.append(f"- **Linked files:** {linked_count}")
+   422→
+   423→    headings = _extract_markdown_headings(content)
+   424→    if headings:
+   425→        lines.extend(["", "**Sections**"])
+   426→        lines.extend(f"- {heading}" for heading in headings)
+   427→
+   428→    lines.extend([
+   429→        "",
+   430→        "_Full skill content is available to the agent but hidden here to keep ACP readable._",
+   431→    ])
+   432→    return "\n".join(lines)
+   433→
+   434→
+   435→def _format_skill_manage_result(result: Optional[str], args: Optional[Dict[str, Any]]) -> Optional[str]:
+   436→    data = _json_loads_maybe(result)
+   437→    if not isinstance(data, dict):
+   438→        return None
+   439→
+   440→    action = str((args or {}).get("action") or "manage").strip() or "manage"
+   441→    name = str((args or {}).get("name") or data.get("name") or "skill").strip() or "skill"
+   442→    file_path = str((args or {}).get("file_path") or data.get("file_path") or "SKILL.md").strip() or "SKILL.md"
+   443→    success = data.get("success")
+   444→    status = "✅ Skill updated" if success is not False else "✗ Skill update failed"
+   445→
+   446→    lines = [f"**{status}**", "", f"- **Action:** `{action}`", f"- **Skill:** `{name}`"]
+   447→    if action not in {"delete"}:
+   448→        lines.append(f"- **File:** `{file_path}`")
+   449→
+   450→    message = str(data.get("message") or data.get("error") or "").strip()
+   451→    if message:
+   452→        lines.append(f"- **Result:** {message}")
+   453→
+   454→    replacements = data.get("replacements") or data.get("replacement_count")
+   455→    if replacements is not None:
+   456→        lines.append(f"- **Replacements:** {replacements}")
+   457→
+   458→    path = str(data.get("path") or "").strip()
+   459→    if path:
+   460→        lines.append(f"- **Path:** `{path}`")
+   461→
+   462→    return "\n".join(lines)
+   463→
+   464→
+   465→def _format_web_search_result(result: Optional[str]) -> Optional[str]:
+   466→    data = _json_loads_maybe(result)
+   467→    if not isinstance(data, dict):
+   468→        return None
+   469→    web = data.get("data", {}).get("web") if isinstance(data.get("data"), dict) else data.get("web")
+   470→    if not isinstance(web, list):
+   471→        return None
+   472→    lines = [f"Web results: {len(web)}"]
+   473→    for item in web[:10]:
+   474→        if not isinstance(item, dict):
+   475→            continue
+   476→        title = str(item.get("title") or item.get("url") or "result").strip()
+   477→        url = str(item.get("url") or "").strip()
+   478→        desc = str(item.get("description") or "").strip()
+   479→        lines.append(f"• {title}" + (f" — {url}" if url else ""))
+   480→        if desc:
+   481→            lines.append(f"  {desc}")
+   482→    return _truncate_text("\n".join(lines))
+   483→
+   484→
+   485→def _format_web_extract_result(result: Optional[str]) -> Optional[str]:
+   486→    """Return only web_extract errors for ACP; success stays compact via title."""
+   487→    data = _json_loads_maybe(result)
+   488→    if not isinstance(data, dict):
+   489→        return None
+   490→    if data.get("success") is False and data.get("error"):
+   491→        return f"Web extract failed: {data.get('error')}"
+   492→    results = data.get("results")
+   493→    if not isinstance(results, list):
+   494→        return None
+   495→
+   496→    failures: list[str] = []
+   497→    for item in results[:10]:
+   498→        if not isinstance(item, dict):
+   499→            continue
+   500→        error = str(item.get("error") or "").strip()
+   501→        if not error or error in {"None", "null"}:
+   502→            continue
+   503→        url = str(item.get("url") or "").strip()
+   504→        title = str(item.get("title") or url or "Untitled").strip()
+   505→        failures.append(
+   506→            f"- {title}" + (f" — {url}" if url and url != title else "") + f"\n  Error: {_truncate_text(error, limit=500)}"
+   507→        )
+   508→
+   509→    if not failures:
+   510→        return None
+   511→    lines = [f"Web extract failed for {len(failures)} URL{'s' if len(failures) != 1 else ''}"]
+   512→    lines.extend(failures)
+   513→    return "\n".join(lines)
+   514→
+   515→
+   516→def _format_process_result(result: Optional[str], args: Optional[Dict[str, Any]]) -> Optional[str]:
+   517→    data = _json_loads_maybe(result)
+   518→    if not isinstance(data, dict):
+   519→        return result if isinstance(result, str) and result.strip() else None
+   520→    if data.get("success") is False and data.get("error"):
+   521→        return f"Process error: {data.get('error')}"
+   522→    action = str((args or {}).get("action") or "process").strip() or "process"
+   523→    if isinstance(data.get("processes"), list):
+   524→        processes = data["processes"]
+   525→        lines = [f"Processes: {len(processes)}"]
+   526→        for proc in processes[:20]:
+   527→            if not isinstance(proc, dict):
+   528→                lines.append(f"- {proc}")
+   529→                continue
+   530→            sid = str(proc.get("session_id") or proc.get("id") or "?")
+   531→            status = str(proc.get("status") or ("exited" if proc.get("exited") else "running"))
+   532→            cmd = str(proc.get("command") or "").strip()
+   533→            pid = proc.get("pid")
+   534→            code = proc.get("exit_code")
+   535→            bits = [status]
+   536→            if pid is not None:
+   537→                bits.append(f"pid {pid}")
+   538→            if code is not None:
+   539→                bits.append(f"exit {code}")
+   540→            lines.append(f"- `{sid}` — {', '.join(bits)}" + (f" — {cmd[:120]}" if cmd else ""))
+   541→        if len(processes) > 20:
+   542→            lines.append(f"... {len(processes) - 20} more process(es)")
+   543→        return "\n".join(lines)
+   544→
+   545→    status = str(data.get("status") or data.get("state") or action).strip()
+   546→    sid = str(data.get("session_id") or (args or {}).get("session_id") or "").strip()
+   547→    lines = [f"Process {action}: {status}" + (f" (`{sid}`)" if sid else "")]
+   548→    for key, label in (("command", "Command"), ("pid", "PID"), ("exit_code", "Exit code"), ("returncode", "Exit code"), ("lines", "Lines")):
+   549→        if data.get(key) is not None:
+   550→            lines.append(f"- **{label}:** {data.get(key)}")
+   551→    output = data.get("output") or data.get("new_output") or data.get("log") or data.get("stdout")
+   552→    error = data.get("error") or data.get("stderr")
+   553→    if output:
+   554→        lines.extend(["", "Output:", _truncate_text(str(output), limit=5000)])
+   555→    if error:
+   556→        lines.extend(["", "Error:", _truncate_text(str(error), limit=2000)])
+   557→    msg = data.get("message")
+   558→    if msg and not output and not error:
+   559→        lines.append(str(msg))
+   560→    return _truncate_text("\n".join(lines), limit=7000)
+   561→
+   562→
+   563→def _format_delegate_result(result: Optional[str]) -> Optional[str]:
+   564→    data = _json_loads_maybe(result)
+   565→    if not isinstance(data, dict):
+   566→        return None
+   567→    if data.get("error") and not isinstance(data.get("results"), list):
+   568→        return f"Delegation failed: {data.get('error')}"
+   569→    results = data.get("results")
+   570→    if not isinstance(results, list):
+   571→        return None
+   572→    total = data.get("total_duration_seconds")
+   573→    lines = [f"Delegation results: {len(results)} task{'s' if len(results) != 1 else ''}" + (f" in {total}s" if total is not None else "")]
+   574→    icon = {"completed": "✅", "failed": "✗", "error": "✗", "timeout": "⏱", "interrupted": "⚠"}
+   575→    for item in results:
+   576→        if not isinstance(item, dict):
+   577→            lines.append(f"- {item}")
+   578→            continue
+   579→        idx = item.get("task_index")
+   580→        status = str(item.get("status") or "unknown")
+   581→        model = item.get("model")
+   582→        dur = item.get("duration_seconds")
+   583→        role = item.get("_child_role")
+   584→        header = f"{icon.get(status, '•')} Task {idx + 1 if isinstance(idx, int) else '?'}: {status}"
+   585→        bits = []
+   586→        if model:
+   587→            bits.append(str(model))
+   588→        if role:
+   589→            bits.append(f"role={role}")
+   590→        if dur is not None:
+   591→            bits.append(f"{dur}s")
+   592→        if bits:
+   593→            header += " (" + ", ".join(bits) + ")"
+   594→        lines.extend(["", header])
+   595→        summary = str(item.get("summary") or "").strip()
+   596→        error = str(item.get("error") or "").strip()
+   597→        if summary:
+   598→            lines.append(_truncate_text(summary, limit=1200))
+   599→        if error:
+   600→            lines.append("Error: " + _truncate_text(error, limit=800))
+   601→        trace = item.get("tool_trace")
+   602→        if isinstance(trace, list) and trace:
+   603→            names = [str(t.get("tool") or "?") for t in trace if isinstance(t, dict)]
+   604→            if names:
+   605→                lines.append("Tools: " + ", ".join(names[:12]) + (f" (+{len(names)-12})" if len(names) > 12 else ""))
+   606→    return _truncate_text("\n".join(lines), limit=8000)
+   607→
+   608→
+   609→def _format_session_search_result(result: Optional[str]) -> Optional[str]:
+   610→    data = _json_loads_maybe(result)
+   611→    if not isinstance(data, dict):
+   612→        return None
+   613→    if data.get("success") is False:
+   614→        return f"Session search failed: {data.get('error', 'unknown error')}"
+   615→    results = data.get("results")
+   616→    if not isinstance(results, list):
+   617→        return None
+   618→    mode = data.get("mode") or "search"
+   619→    query = data.get("query")
+   620→    lines = ["Recent sessions" if mode == "recent" else f"Session search results" + (f" for `{query}`" if query else "")]
+   621→    if not results:
+   622→        lines.append(str(data.get("message") or "No matching sessions found."))
+   623→        return "\n".join(lines)
+   624→    for item in results:
+   625→        if not isinstance(item, dict):
+   626→            continue
+   627→        sid = str(item.get("session_id") or "?")
+   628→        title = str(item.get("title") or item.get("when") or "Untitled session").strip()
+   629→        when = str(item.get("last_active") or item.get("started_at") or item.get("when") or "").strip()
+   630→        count = item.get("message_count")
+   631→        source = str(item.get("source") or "").strip()
+   632→        meta = ", ".join(str(x) for x in [when, source, f"{count} msgs" if count is not None else ""] if x)
+   633→        lines.append(f"- **{title}** (`{sid}`)" + (f" — {meta}" if meta else ""))
+   634→        summary = str(item.get("summary") or item.get("preview") or "").strip()
+   635→        if summary:
+   636→            lines.append("  " + _truncate_text(" ".join(summary.split()), limit=500))
+   637→    return _truncate_text("\n".join(lines), limit=7000)
+   638→
+   639→
+   640→def _format_memory_result(result: Optional[str], args: Optional[Dict[str, Any]]) -> Optional[str]:
+   641→    data = _json_loads_maybe(result)
+   642→    if not isinstance(data, dict):
+   643→        return None
+   644→    action = str((args or {}).get("action") or "memory").strip() or "memory"
+   645→    target = str(data.get("target") or (args or {}).get("target") or "memory")
+   646→    if data.get("success") is False:
+   647→        lines = [f"✗ Memory {action} failed ({target})", str(data.get("error") or "unknown error")]
+   648→        matches = data.get("matches")
+   649→        if isinstance(matches, list) and matches:
+   650→            lines.append("Matches:")
+   651→            lines.extend(f"- {_truncate_text(str(m), 160)}" for m in matches[:5])
+   652→        return "\n".join(lines)
+   653→    lines = [f"✅ Memory {action} saved ({target})"]
+   654→    if data.get("message"):
+   655→        lines.append(str(data.get("message")))
+   656→    if data.get("entry_count") is not None:
+   657→        lines.append(f"Entries: {data.get('entry_count')}")
+   658→    if data.get("usage"):
+   659→        lines.append(f"Usage: {data.get('usage')}")
+   660→    # Avoid dumping all memory entries into ACP UI; show only the explicit new value preview.
+   661→    preview = str((args or {}).get("content") or (args or {}).get("old_text") or "").strip()
+   662→    if preview:
+   663→        lines.append("Preview: " + _truncate_text(preview, limit=300))
+   664→    return "\n".join(lines)
+   665→
+   666→
+   667→def _format_edit_result(tool_name: str, result: Optional[str], args: Optional[Dict[str, Any]]) -> Optional[str]:
+   668→    data = _json_loads_maybe(result)
+   669→    path = str((args or {}).get("path") or "file").strip()
+   670→    if isinstance(data, dict):
+   671→        if data.get("success") is False or data.get("error"):
+   672→            return f"{tool_name} failed for {path}: {data.get('error', 'unknown error')}"
+   673→        message = str(data.get("message") or "").strip()
+   674→        replacements = data.get("replacements") or data.get("replacement_count")
+   675→        lines = [f"✅ {tool_name} completed" + (f" for `{path}`" if path else "")]
+   676→        if message:
+   677→            lines.append(message)
+   678→        if replacements is not None:
+   679→            lines.append(f"Replacements: {replacements}")
+   680→        if data.get("files_modified"):
+   681→            files = data.get("files_modified")
+   682→            if isinstance(files, list):
+   683→                lines.append("Files: " + ", ".join(f"`{f}`" for f in files[:8]))
+   684→        return "\n".join(lines)
+   685→    if isinstance(result, str) and result.strip():
+   686→        return _truncate_text(result, limit=3000)
+   687→    return f"✅ {tool_name} completed" + (f" for `{path}`" if path else "")
+   688→
+   689→
+   690→def _format_browser_result(tool_name: str, result: Optional[str], args: Optional[Dict[str, Any]]) -> Optional[str]:
+   691→    data = _json_loads_maybe(result)
+   692→    if not isinstance(data, dict):
+   693→        return result if isinstance(result, str) and result.strip() else None
+   694→    if data.get("success") is False or data.get("error"):
+   695→        return f"{tool_name} failed: {data.get('error', 'unknown error')}"
+   696→    if tool_name == "browser_get_images":
+   697→        images = data.get("images") or data.get("data")
+   698→        if isinstance(images, list):
+   699→            lines = [f"Images found: {len(images)}"]
+   700→            for img in images[:12]:
+   701→                if isinstance(img, dict):
+   702→                    alt = str(img.get("alt") or "").strip()
+   703→                    url = str(img.get("url") or img.get("src") or "").strip()
+   704→                    lines.append(f"- {alt or 'image'}" + (f" — {url}" if url else ""))
+   705→            return _truncate_text("\n".join(lines), limit=5000)
+   706→    title = str(data.get("title") or data.get("url") or data.get("status") or tool_name)
+   707→    text = str(data.get("text") or data.get("content") or data.get("snapshot") or data.get("analysis") or data.get("message") or "").strip()
+   708→    lines = [title]
+   709→    if data.get("url") and data.get("url") != title:
+   710→        lines.append(str(data.get("url")))
+   711→    if text:
+   712→        lines.extend(["", _truncate_text(text, limit=5000)])
+   713→    return _truncate_text("\n".join(lines), limit=7000)
+   714→
+   715→
+   716→def _format_media_or_cron_result(tool_name: str, result: Optional[str]) -> Optional[str]:
+   717→    data = _json_loads_maybe(result)
+   718→    if not isinstance(data, dict):
+   719→        return result if isinstance(result, str) and result.strip() else None
+   720→    if data.get("success") is False or data.get("error"):
+   721→        return f"{tool_name} failed: {data.get('error', 'unknown error')}"
+   722→    lines = [f"✅ {tool_name} completed"]
+   723→    for key in ("file_path", "path", "url", "image_url", "job_id", "id", "status", "message", "next_run"):
+   724→        if data.get(key):
+   725→            lines.append(f"- **{key}:** {data.get(key)}")
+   726→    return "\n".join(lines)
+   727→
+   728→
+   729→def _format_structured_value(
+   730→    key: str,
+   731→    value: Any,
+   732→    *,
+   733→    indent: int = 0,
+   734→    max_depth: int = 3,
+   735→    max_items: int = 8,
+   736→) -> List[str]:
+   737→    """Render nested JSON-ish values as compact Markdown bullets, not inline blobs."""
+   738→    prefix = "  " * indent
+   739→    bullet = f"{prefix}- "
+   740→    label = f"**{key}:**" if key else ""
+   741→
+   742→    if value in (None, "", [], {}):
+   743→        return []
+   744→
+   745→    if max_depth <= 0:
+   746→        if isinstance(value, (dict, list)):
+   747→            preview = json.dumps(value, ensure_ascii=False, default=str)
+   748→        else:
+   749→            preview = str(value)
+   750→        return [f"{bullet}{label} {_truncate_text(preview, limit=240)}" if label else f"{bullet}{_truncate_text(preview, limit=240)}"]
+   751→
+   752→    if isinstance(value, dict):
+   753→        lines = [f"{bullet}{label}" if label else f"{bullet}{len(value)} fields"]
+   754→        shown = 0
+   755→        for child_key, child_value in value.items():
+   756→            if child_value in (None, "", [], {}):
+   757→                continue
+   758→            lines.extend(
+   759→                _format_structured_value(
+   760→                    str(child_key),
+   761→                    child_value,
+   762→                    indent=indent + 1,
+   763→                    max_depth=max_depth - 1,
+   764→                    max_items=max_items,
+   765→                )
+   766→            )
+   767→            shown += 1
+   768→            if shown >= max_items:
+   769→                remaining = max(0, len(value) - shown)
+   770→                if remaining:
+   771→                    lines.append(f"{'  ' * (indent + 1)}- ... {remaining} more fields")
+   772→                break
+   773→        return lines
+   774→
+   775→    if isinstance(value, list):
+   776→        lines = [f"{bullet}{label} {len(value)} item{'s' if len(value) != 1 else ''}" if label else f"{bullet}{len(value)} item{'s' if len(value) != 1 else ''}"]
+   777→        for idx, item in enumerate(value[:max_items], 1):
+   778→            if isinstance(item, dict):
+   779→                headline = str(item.get("content") or item.get("message") or item.get("title") or item.get("name") or item.get("id") or "").strip()
+   780→                if headline:
+   781→                    lines.append(f"{'  ' * (indent + 1)}{idx}. {_truncate_text(headline, limit=220)}")
+   782→                    for child_key in ("id", "status", "type", "scope", "quality_score", "score", "path", "url"):
+   783→                        child_value = item.get(child_key)
+   784→                        if child_value not in (None, "", [], {}):
+   785→                            lines.append(f"{'  ' * (indent + 2)}- **{child_key}:** {_truncate_text(str(child_value), limit=180)}")
+   786→                else:
+   787→                    lines.append(f"{'  ' * (indent + 1)}{idx}.")
+   788→                    for child_key, child_value in list(item.items())[:max_items]:
+   789→                        lines.extend(
+   790→                            _format_structured_value(
+   791→                                str(child_key),
+   792→                                child_value,
+   793→                                indent=indent + 2,
+   794→                                max_depth=max_depth - 1,
+   795→                                max_items=max_items,
+   796→                            )
+   797→                        )
+   798→            elif isinstance(item, list):
+   799→                lines.append(f"{'  ' * (indent + 1)}{idx}. {len(item)} items")
+   800→                for nested in item[:max_items]:
+   801→                    lines.extend(
+   802→                        _format_structured_value(
+   803→                            "",
+   804→                            nested,
+   805→                            indent=indent + 2,
+   806→                            max_depth=max_depth - 1,
+   807→                            max_items=max_items,
+   808→                        )
+   809→                    )
+   810→            else:
+   811→                lines.append(f"{'  ' * (indent + 1)}{idx}. {_truncate_text(str(item), limit=240)}")
+   812→        if len(value) > max_items:
+   813→            lines.append(f"{'  ' * (indent + 1)}... {len(value) - max_items} more items")
+   814→        return lines
+   815→
+   816→    return [f"{bullet}{label} {_truncate_text(str(value), limit=500)}" if label else f"{bullet}{_truncate_text(str(value), limit=500)}"]
+   817→
+   818→
+   819→def _format_generic_structured_result(
+   820→    tool_name: str,
+   821→    result: Optional[str],
+   822→    *,
+   823→    fallback_to_text: bool = True,
+   824→) -> Optional[str]:
+   825→    data = _json_loads_maybe(result)
+   826→    if not isinstance(data, (dict, list)):
+   827→        return result if fallback_to_text and isinstance(result, str) and result.strip() else None
+   828→    if isinstance(data, list):
+   829→        lines = [f"{tool_name}: {len(data)} item{'s' if len(data) != 1 else ''}"]
+   830→        for item in data[:12]:
+   831→            if isinstance(item, (dict, list)):
+   832→                lines.extend(_format_structured_value("", item, indent=0, max_depth=2, max_items=6))
+   833→            else:
+   834→                lines.append(f"- {_truncate_text(str(item), limit=240)}")
+   835→        if len(data) > 12:
+   836→            lines.append(f"... {len(data) - 12} more items")
+   837→        return _truncate_text("\n".join(lines), limit=5000)
+   838→
+   839→    if data.get("success") is False or data.get("error"):
+   840→        return f"{tool_name} failed: {data.get('error', 'unknown error')}"
+   841→
+   842→    lines = [f"✅ {tool_name} completed" if data.get("success") is True else f"{tool_name} result"]
+   843→    priority_keys = (
+   844→        "message", "status", "id", "task_id", "issue_id", "title", "name", "entity_id",
+   845→        "state", "service", "url", "path", "file_path", "count", "total", "next_run",
+   846→    )
+   847→    seen = set()
+   848→    for key in priority_keys:
+   849→        value = data.get(key)
+   850→        if value in (None, "", [], {}):
+   851→            continue
+   852→        seen.add(key)
+   853→        lines.append(f"- **{key}:** {_truncate_text(str(value), limit=500)}")
+   854→
+   855→    for key, value in data.items():
+   856→        if key in seen or key in {"success", "raw", "content", "entries"}:
+   857→            continue
+   858→        if value in (None, "", [], {}):
+   859→            continue
+   860→        lines.extend(_format_structured_value(str(key), value, indent=0, max_depth=3, max_items=8))
+   861→        if len(lines) >= 40:
+   862→            lines.append("- ... more fields truncated")
+   863→            break
+   864→
+   865→    content = data.get("content")
+   866→    if isinstance(content, str) and content.strip():
+   867→        lines.extend(["", _truncate_text(content.strip(), limit=1500)])
+   868→    return _truncate_text("\n".join(lines), limit=7000)
+   869→
+   870→
+   871→def _build_polished_completion_content(
+   872→    tool_name: str,
+   873→    result: Optional[str],
+   874→    function_args: Optional[Dict[str, Any]],
+   875→) -> Optional[List[Any]]:
+   876→    formatter = {
+   877→        "todo": lambda: _format_todo_result(result),
+   878→        "read_file": lambda: _format_read_file_result(result, function_args),
+   879→        "write_file": lambda: _format_edit_result(tool_name, result, function_args),
+   880→        "patch": lambda: _format_edit_result(tool_name, result, function_args),
+   881→        "search_files": lambda: _format_search_files_result(result),
+   882→        "execute_code": lambda: _format_execute_code_result(result),
+   883→        "process": lambda: _format_process_result(result, function_args),
+   884→        "delegate_task": lambda: _format_delegate_result(result),
+   885→        "session_search": lambda: _format_session_search_result(result),
+   886→        "memory": lambda: _format_memory_result(result, function_args),
+   887→        "skill_view": lambda: _format_skill_view_result(result),
+   888→        "skill_manage": lambda: _format_skill_manage_result(result, function_args),
+   889→        "web_search": lambda: _format_web_search_result(result),
+   890→        "web_extract": lambda: _format_web_extract_result(result),
+   891→        "browser_navigate": lambda: _format_browser_result(tool_name, result, function_args),
+   892→        "browser_snapshot": lambda: _format_browser_result(tool_name, result, function_args),
+   893→        "browser_vision": lambda: _format_browser_result(tool_name, result, function_args),
+   894→        "browser_get_images": lambda: _format_browser_result(tool_name, result, function_args),
+   895→        "vision_analyze": lambda: _format_media_or_cron_result(tool_name, result),
+   896→        "image_generate": lambda: _format_media_or_cron_result(tool_name, result),
+   897→        "cronjob": lambda: _format_media_or_cron_result(tool_name, result),
+   898→    }.get(tool_name)
+   899→    if formatter is None and tool_name in _POLISHED_TOOLS:
+   900→        formatter = lambda: _format_generic_structured_result(tool_name, result)
+   901→    if formatter is None:
+   902→        text = _format_generic_structured_result(tool_name, result, fallback_to_text=False)
+   903→    else:
+   904→        text = formatter()
+   905→    if not text:
+   906→        return None
+   907→    return [_text(text)]
+   908→
+   909→
+   910→def _strip_diff_prefix(path: str) -> str:
+   911→    raw = str(path or "").strip()
+   912→    if raw.startswith(("a/", "b/")):
+   913→        return raw[2:]
+   914→    return raw
+   915→
+   916→
+   917→def _parse_unified_diff_content(diff_text: str) -> List[Any]:
+   918→    """Convert unified diff text into ACP diff content blocks."""
+   919→    if not diff_text:
+   920→        return []
+   921→
+   922→    content: List[Any] = []
+   923→    current_old_path: Optional[str] = None
+   924→    current_new_path: Optional[str] = None
+   925→    old_lines: list[str] = []
+   926→    new_lines: list[str] = []
+   927→
+   928→    def _flush() -> None:
+   929→        nonlocal current_old_path, current_new_path, old_lines, new_lines
+   930→        if current_old_path is None and current_new_path is None:
+   931→            return
+   932→        path = current_new_path if current_new_path and current_new_path != "/dev/null" else current_old_path
+   933→        if not path or path == "/dev/null":
+   934→            current_old_path = None
+   935→            current_new_path = None
+   936→            old_lines = []
+   937→            new_lines = []
+   938→            return
+   939→        content.append(
+   940→            acp.tool_diff_content(
+   941→                path=_strip_diff_prefix(path),
+   942→                old_text="\n".join(old_lines) if old_lines else None,
+   943→                new_text="\n".join(new_lines),
+   944→            )
+   945→        )
+   946→        current_old_path = None
+   947→        current_new_path = None
+   948→        old_lines = []
+   949→        new_lines = []
+   950→
+   951→    for line in diff_text.splitlines():
+   952→        if line.startswith("--- "):
+   953→            _flush()
+   954→            current_old_path = line[4:].strip()
+   955→            continue
+   956→        if line.startswith("+++ "):
+   957→            current_new_path = line[4:].strip()
+   958→            continue
+   959→        if line.startswith("@@"):
+   960→            continue
+   961→        if current_old_path is None and current_new_path is None:
+   962→            continue
+   963→        if line.startswith("+"):
+   964→            new_lines.append(line[1:])
+   965→        elif line.startswith("-"):
+   966→            old_lines.append(line[1:])
+   967→        elif line.startswith(" "):
+   968→            shared = line[1:]
+   969→            old_lines.append(shared)
+   970→            new_lines.append(shared)
+   971→
+   972→    _flush()
+   973→    return content
+   974→
+   975→
+   976→def _build_tool_complete_content(
+   977→    tool_name: str,
+   978→    result: Optional[str],
+   979→    *,
+   980→    function_args: Optional[Dict[str, Any]] = None,
+   981→    snapshot: Any = None,
+   982→) -> List[Any]:
+   983→    """Build structured ACP completion content, falling back to plain text."""
+   984→    display_result = result or ""
+   985→    if len(display_result) > 5000:
+   986→        display_result = display_result[:4900] + f"\n... ({len(result)} chars total, truncated)"
+   987→
+   988→    if tool_name == "skill_manage":
+   989→        try:
+   990→            from agent.display import extract_edit_diff
+   991→
+   992→            diff_text = extract_edit_diff(
+   993→                tool_name,
+   994→                result,
+   995→                function_args=function_args,
+   996→                snapshot=snapshot,
+   997→            )
+   998→            if isinstance(diff_text, str) and diff_text.strip():
+   999→                diff_content = _parse_unified_diff_content(diff_text)
+  1000→                if diff_content:
+  1001→                    return diff_content
+  1002→        except Exception:
+  1003→            pass
+  1004→
+  1005→    polished_content = _build_polished_completion_content(tool_name, result, function_args)
+  1006→    if polished_content:
+  1007→        return polished_content
+  1008→
+  1009→    return [_text(display_result)]
+  1010→
+  1011→
+  1012→# ---------------------------------------------------------------------------
+  1013→# Build ACP content objects for tool-call events
+  1014→# ---------------------------------------------------------------------------
+  1015→
+  1016→
+  1017→def build_tool_start(
+  1018→    tool_call_id: str,
+  1019→    tool_name: str,
+  1020→    arguments: Dict[str, Any],
+  1021→    *,
+  1022→    edit_diff: Any = None,
+  1023→) -> ToolCallStart:
+  1024→    """Create a ToolCallStart event for the given hermes tool invocation."""
+  1025→    kind = get_tool_kind(tool_name)
+  1026→    title = build_tool_title(tool_name, arguments)
+  1027→    locations = extract_locations(arguments)
+  1028→
+  1029→    if tool_name == "patch":
+  1030→        if edit_diff is not None:
+  1031→            content = [
+  1032→                acp.tool_diff_content(
+  1033→                    path=edit_diff.path,
+  1034→                    old_text=edit_diff.old_text,
+  1035→                    new_text=edit_diff.new_text,
+  1036→                )
+  1037→            ]
+  1038→        else:
+  1039→            mode = arguments.get("mode", "replace")
+  1040→            path = arguments.get("path") or "patch input"
+  1041→            content = [_text(f"Preparing {mode} edit for {path}. Approval prompt shows the diff.")]
+  1042→        return acp.start_tool_call(
+  1043→            tool_call_id, title, kind=kind, content=content, locations=locations,
+  1044→        )
+  1045→
+  1046→    if tool_name == "write_file":
+  1047→        if edit_diff is not None:
+  1048→            content = [
+  1049→                acp.tool_diff_content(
+  1050→                    path=edit_diff.path,
+  1051→                    old_text=edit_diff.old_text,
+  1052→                    new_text=edit_diff.new_text,
+  1053→                )
+  1054→            ]
+  1055→        else:
+  1056→            path = arguments.get("path", "")
+  1057→            content = [_text(f"Preparing write to {path}. Approval prompt shows the diff." if path else "Preparing file write. Approval prompt shows the diff.")]
+  1058→        return acp.start_tool_call(
+  1059→            tool_call_id, title, kind=kind, content=content, locations=locations,
+  1060→        )
+  1061→
+  1062→    if tool_name == "terminal":
+  1063→        command = arguments.get("command", "")
+  1064→        content = [_text(f"$ {command}")]
+  1065→        return acp.start_tool_call(
+  1066→            tool_call_id, title, kind=kind, content=content, locations=locations,
+  1067→        )
+  1068→
+  1069→    if tool_name == "read_file":
+  1070→        # The title and location already identify the file. Sending a synthetic
+  1071→        # "Reading ..." content block makes Zed render an unhelpful Output
+  1072→        # section before the real file contents arrive on completion.
+  1073→        return acp.start_tool_call(
+  1074→            tool_call_id, title, kind=kind, content=None, locations=locations,
+  1075→        )
+  1076→
+  1077→    if tool_name == "search_files":
+  1078→        pattern = arguments.get("pattern", "")
+  1079→        target = arguments.get("target", "content")
+  1080→        search_path = arguments.get("path")
+  1081→        where = f" in {search_path}" if search_path else ""
+  1082→        content = [_text(f"Searching for '{pattern}' ({target}){where}")]
+  1083→        return acp.start_tool_call(
+  1084→            tool_call_id, title, kind=kind, content=content, locations=locations,
+  1085→        )
+  1086→
+  1087→    if tool_name == "todo":
+  1088→        items = arguments.get("todos")
+  1089→        if isinstance(items, list):
+  1090→            preview_lines = ["Updating todo list", ""]
+  1091→            for item in items[:8]:
+  1092→                if isinstance(item, dict):
+  1093→                    preview_lines.append(f"- {item.get('status', 'pending')}: {item.get('content', item.get('id', ''))}")
+  1094→            if len(items) > 8:
+  1095→                preview_lines.append(f"... {len(items) - 8} more")
+  1096→            content = [_text("\n".join(preview_lines))]
+  1097→        else:
+  1098→            content = [_text("Reading todo list")]
+  1099→        return acp.start_tool_call(
+  1100→            tool_call_id, title, kind=kind, content=content, locations=locations,
+  1101→        )
+  1102→
+  1103→    if tool_name == "skill_view":
+  1104→        name = str(arguments.get("name") or "?").strip() or "?"
+  1105→        file_path = str(arguments.get("file_path") or "SKILL.md").strip() or "SKILL.md"
+  1106→        content = [_text(f"Loading skill '{name}' ({file_path})")]
+  1107→        return acp.start_tool_call(
+  1108→            tool_call_id, title, kind=kind, content=content, locations=locations,
+  1109→        )
+  1110→
+  1111→    if tool_name == "skill_manage":
+  1112→        action = str(arguments.get("action") or "manage").strip() or "manage"
+  1113→        name = str(arguments.get("name") or "?").strip() or "?"
+  1114→        file_path = str(arguments.get("file_path") or "SKILL.md").strip() or "SKILL.md"
+  1115→        path = f"skills/{name}/{file_path}" if file_path else f"skills/{name}"
+  1116→
+  1117→        if action == "patch":
+  1118→            old = str(arguments.get("old_string") or "")
+  1119→            new = str(arguments.get("new_string") or "")
+  1120→            content = [acp.tool_diff_content(path=path, old_text=old or None, new_text=new)]
+  1121→        elif action in {"edit", "create"}:
+  1122→            content = [
+  1123→                acp.tool_diff_content(
+  1124→                    path=path,
+  1125→                    new_text=str(arguments.get("content") or ""),
+  1126→                )
+  1127→            ]
+  1128→        elif action == "write_file":
+  1129→            target = str(arguments.get("file_path") or "file")
+  1130→            content = [
+  1131→                acp.tool_diff_content(
+  1132→                    path=f"skills/{name}/{target}",
+  1133→                    new_text=str(arguments.get("file_content") or ""),
+  1134→                )
+  1135→            ]
+  1136→        elif action in {"delete", "remove_file"}:
+  1137→            target = str(arguments.get("file_path") or file_path or name)
+  1138→            content = [_text(f"Removing {target} from skill '{name}'")]
+  1139→        else:
+  1140→            content = [_text(f"Running skill_manage action '{action}' on skill '{name}' ({file_path})")]
+  1141→
+  1142→        return acp.start_tool_call(
+  1143→            tool_call_id, title, kind=kind, content=content, locations=locations,
+  1144→        )
+  1145→
+  1146→    if tool_name == "execute_code":
+  1147→        code = str(arguments.get("code") or "").strip()
+  1148→        preview = code[:1200] + (f"\n... ({len(code)} chars total, truncated)" if len(code) > 1200 else "")
+  1149→        content = [_text(f"Running Python helper script:\n\n```python\n{preview}\n```" if preview else "Running Python helper script")]
+  1150→        return acp.start_tool_call(
+  1151→            tool_call_id, title, kind=kind, content=content, locations=locations,
+  1152→        )
+  1153→
+  1154→    if tool_name == "web_search":
+  1155→        query = str(arguments.get("query") or "").strip()
+  1156→        content = [_text(f"Searching the web for: {query}" if query else "Searching the web")]
+  1157→        return acp.start_tool_call(
+  1158→            tool_call_id, title, kind=kind, content=content, locations=locations,
+  1159→        )
+  1160→
+  1161→    if tool_name == "web_extract":
+  1162→        # The title identifies the URL(s). Avoid a duplicate content block so
+  1163→        # Zed renders this like read_file: compact start, concise completion.
+  1164→        return acp.start_tool_call(
+  1165→            tool_call_id, title, kind=kind, content=None, locations=locations,
+  1166→        )
+  1167→
+  1168→    if tool_name == "process":
+  1169→        action = str(arguments.get("action") or "").strip() or "manage"
+  1170→        sid = str(arguments.get("session_id") or "").strip()
+  1171→        data_preview = str(arguments.get("data") or "").strip()
+  1172→        text = f"Process action: {action}" + (f"\nSession: {sid}" if sid else "")
+  1173→        if data_preview:
+  1174→            text += "\nInput: " + _truncate_text(data_preview, limit=500)
+  1175→        content = [_text(text)]
+  1176→        return acp.start_tool_call(
+  1177→            tool_call_id, title, kind=kind, content=content, locations=locations,
+  1178→        )
+  1179→
+  1180→    if tool_name == "delegate_task":
+  1181→        tasks = arguments.get("tasks")
+  1182→        if isinstance(tasks, list) and tasks:
+  1183→            lines = [f"Delegating {len(tasks)} tasks", ""]
+  1184→            for i, task in enumerate(tasks[:8], 1):
+  1185→                if isinstance(task, dict):
+  1186→                    goal = str(task.get("goal") or "").strip()
+  1187→                    role = str(task.get("role") or "").strip()
+  1188→                    lines.append(f"{i}. " + _truncate_text(goal, limit=160) + (f" ({role})" if role else ""))
+  1189→            if len(tasks) > 8:
+  1190→                lines.append(f"... {len(tasks) - 8} more")
+  1191→            content = [_text("\n".join(lines))]
+  1192→        else:
+  1193→            goal = str(arguments.get("goal") or "").strip()
+  1194→            content = [_text("Delegating task" + (f":\n{_truncate_text(goal, limit=800)}" if goal else ""))]
+  1195→        return acp.start_tool_call(
+  1196→            tool_call_id, title, kind=kind, content=content, locations=locations,
+  1197→        )
+  1198→
+  1199→    if tool_name == "session_search":
+  1200→        query = str(arguments.get("query") or "").strip()
+  1201→        content = [_text(f"Searching past sessions for: {query}" if query else "Loading recent sessions")]
+  1202→        return acp.start_tool_call(
+  1203→            tool_call_id, title, kind=kind, content=content, locations=locations,
+  1204→        )
+  1205→
+  1206→    if tool_name == "memory":
+  1207→        action = str(arguments.get("action") or "manage").strip() or "manage"
+  1208→        target = str(arguments.get("target") or "memory").strip() or "memory"
+  1209→        preview = str(arguments.get("content") or arguments.get("old_text") or "").strip()
+  1210→        text = f"Memory {action} ({target})"
+  1211→        if preview:
+  1212→            text += "\nPreview: " + _truncate_text(preview, limit=500)
+  1213→        content = [_text(text)]
+  1214→        return acp.start_tool_call(
+  1215→            tool_call_id, title, kind=kind, content=content, locations=locations,
+  1216→        )
+  1217→
+  1218→    if tool_name in _POLISHED_TOOLS:
+  1219→        try:
+  1220→            args_text = json.dumps(arguments, indent=2, default=str)
+  1221→        except (TypeError, ValueError):
+  1222→            args_text = str(arguments)
+  1223→        content = [_text(_truncate_text(args_text, limit=1200))]
+  1224→        return acp.start_tool_call(
+  1225→            tool_call_id, title, kind=kind, content=content, locations=locations,
+  1226→        )
+  1227→
+  1228→    if not arguments:
+  1229→        return acp.start_tool_call(
+  1230→            tool_call_id, title, kind=kind, content=None, locations=locations, raw_input=None,
+  1231→        )
+  1232→
+  1233→    # Generic fallback
+  1234→    try:
+  1235→        args_text = json.dumps(arguments, indent=2, default=str)
+  1236→    except (TypeError, ValueError):
+  1237→        args_text = str(arguments)
+  1238→    content = [acp.tool_content(acp.text_block(args_text))]
+  1239→    return acp.start_tool_call(
+  1240→        tool_call_id, title, kind=kind, content=content, locations=locations,
+  1241→        raw_input=None if tool_name in _POLISHED_TOOLS else arguments,
+  1242→    )
+  1243→
+  1244→
+  1245→def _is_structured_json_result(result: Optional[str]) -> bool:
+  1246→    return isinstance(_json_loads_maybe(result), (dict, list))
+  1247→
+  1248→
+  1249→def build_tool_complete(
+  1250→    tool_call_id: str,
+  1251→    tool_name: str,
+  1252→    result: Optional[str] = None,
+  1253→    function_args: Optional[Dict[str, Any]] = None,
+  1254→    snapshot: Any = None,
+  1255→) -> ToolCallProgress:
+  1256→    """Create a ToolCallUpdate (progress) event for a completed tool call."""
+  1257→    kind = get_tool_kind(tool_name)
+  1258→    if tool_name == "web_extract":
+  1259→        error_text = _format_web_extract_result(result)
+  1260→        content = [_text(error_text)] if error_text else None
+  1261→    else:
+  1262→        content = _build_tool_complete_content(
+  1263→            tool_name,
+  1264→            result,
+  1265→            function_args=function_args,
+  1266→            snapshot=snapshot,
+  1267→        )
+  1268→    return acp.update_tool_call(
+  1269→        tool_call_id,
+  1270→        kind=kind,
+  1271→        status="failed" if _tool_result_failed(result, tool_name) else "completed",
+  1272→        content=content,
+  1273→        raw_output=None if tool_name in _POLISHED_TOOLS or _is_structured_json_result(result) else result,
+  1274→    )
+  1275→
+  1276→
+  1277→# ---------------------------------------------------------------------------
+  1278→# Location extraction
+  1279→# ---------------------------------------------------------------------------
+  1280→
+  1281→
+  1282→def extract_locations(
+  1283→    arguments: Dict[str, Any],
+  1284→) -> List[ToolCallLocation]:
+  1285→    """Extract file-system locations from tool arguments."""
+  1286→    locations: List[ToolCallLocation] = []
+  1287→    path = arguments.get("path")
+  1288→    if path:
+  1289→        line = arguments.get("offset") or arguments.get("line")
+  1290→        locations.append(ToolCallLocation(path=path, line=line))
+  1291→    return locations
+  1292→

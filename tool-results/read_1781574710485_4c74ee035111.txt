@@ -1,0 +1,2002 @@
+     1→"""ACP agent server — exposes Hermes Agent via the Agent Client Protocol."""
+     2→
+     3→from __future__ import annotations
+     4→
+     5→import asyncio
+     6→from datetime import datetime, timezone
+     7→import base64
+     8→import contextvars
+     9→import json
+    10→import logging
+    11→import os
+    12→from collections import defaultdict, deque
+    13→from concurrent.futures import ThreadPoolExecutor
+    14→from pathlib import Path
+    15→from typing import Any, Deque, Optional
+    16→from urllib.parse import unquote, urlparse
+    17→
+    18→import acp
+    19→from acp.schema import (
+    20→    AgentCapabilities,
+    21→    AgentMessageChunk,
+    22→    AgentThoughtChunk,
+    23→    AuthenticateResponse,
+    24→    AvailableCommand,
+    25→    AvailableCommandsUpdate,
+    26→    BlobResourceContents,
+    27→    ClientCapabilities,
+    28→    EmbeddedResourceContentBlock,
+    29→    ForkSessionResponse,
+    30→    ImageContentBlock,
+    31→    AudioContentBlock,
+    32→    Implementation,
+    33→    InitializeResponse,
+    34→    ListSessionsResponse,
+    35→    LoadSessionResponse,
+    36→    McpServerHttp,
+    37→    McpServerSse,
+    38→    McpServerStdio,
+    39→    ModelInfo,
+    40→    NewSessionResponse,
+    41→    PromptCapabilities,
+    42→    PromptResponse,
+    43→    ResumeSessionResponse,
+    44→    SetSessionConfigOptionResponse,
+    45→    SetSessionModelResponse,
+    46→    SetSessionModeResponse,
+    47→    ResourceContentBlock,
+    48→    SessionCapabilities,
+    49→    SessionForkCapabilities,
+    50→    SessionInfoUpdate,
+    51→    SessionListCapabilities,
+    52→    SessionMode,
+    53→    SessionModeState,
+    54→    SessionModelState,
+    55→    SessionResumeCapabilities,
+    56→    SessionInfo,
+    57→    TextContentBlock,
+    58→    TextResourceContents,
+    59→    UnstructuredCommandInput,
+    60→    Usage,
+    61→    UsageUpdate,
+    62→    UserMessageChunk,
+    63→)
+    64→
+    65→from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
+    66→from acp_adapter.events import (
+    67→    _build_plan_update_from_todo_result,
+    68→    make_message_cb,
+    69→    make_step_cb,
+    70→    make_thinking_cb,
+    71→    make_tool_progress_cb,
+    72→)
+    73→from acp_adapter.permissions import make_approval_callback
+    74→from acp_adapter.provenance import session_provenance_meta
+    75→from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
+    76→from acp_adapter.tools import build_tool_complete, build_tool_start
+    77→
+    78→logger = logging.getLogger(__name__)
+    79→
+    80→try:
+    81→    from hermes_cli import __version__ as HERMES_VERSION
+    82→except Exception:
+    83→    HERMES_VERSION = "0.0.0"
+    84→
+    85→# Thread pool for running AIAgent (synchronous) in parallel.
+    86→_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="acp-agent")
+    87→
+    88→# Server-side page size for list_sessions. The ACP ListSessionsRequest schema
+    89→# does not expose a client-side limit, so this is a fixed cap that clients
+    90→# paginate against using `cursor` / `next_cursor`.
+    91→_LIST_SESSIONS_PAGE_SIZE = 50
+    92→_MAX_ACP_RESOURCE_BYTES = 512 * 1024
+    93→_TEXT_RESOURCE_MIME_PREFIXES = ("text/",)
+    94→_TEXT_RESOURCE_MIME_TYPES = {
+    95→    "application/json",
+    96→    "application/javascript",
+    97→    "application/typescript",
+    98→    "application/xml",
+    99→    "application/x-yaml",
+   100→    "application/yaml",
+   101→    "application/toml",
+   102→    "application/sql",
+   103→}
+   104→
+   105→
+   106→def _resource_display_name(uri: str, name: str | None = None, title: str | None = None) -> str:
+   107→    """Human-readable attachment name for prompt context."""
+   108→    raw_name = (name or "").strip()
+   109→    raw_title = (title or "").strip()
+   110→    if raw_title and raw_name and raw_title != raw_name:
+   111→        return f"{raw_title} ({raw_name})"
+   112→    if raw_title:
+   113→        return raw_title
+   114→    if raw_name:
+   115→        return raw_name
+   116→    parsed = urlparse(uri)
+   117→    candidate = parsed.path if parsed.scheme else uri
+   118→    return Path(unquote(candidate)).name or uri or "resource"
+   119→
+   120→
+   121→def _is_text_resource(mime_type: str | None) -> bool:
+   122→    mime = (mime_type or "").split(";", 1)[0].strip().lower()
+   123→    if not mime:
+   124→        return False
+   125→    return mime.startswith(_TEXT_RESOURCE_MIME_PREFIXES) or mime in _TEXT_RESOURCE_MIME_TYPES
+   126→
+   127→
+   128→def _is_image_resource(mime_type: str | None) -> bool:
+   129→    mime = (mime_type or "").split(";", 1)[0].strip().lower()
+   130→    return mime.startswith("image/")
+   131→
+   132→
+   133→def _guess_image_mime_from_path(path: Path) -> str | None:
+   134→    suffix = path.suffix.lower()
+   135→    return {
+   136→        ".png": "image/png",
+   137→        ".jpg": "image/jpeg",
+   138→        ".jpeg": "image/jpeg",
+   139→        ".gif": "image/gif",
+   140→        ".webp": "image/webp",
+   141→        ".bmp": "image/bmp",
+   142→        ".svg": "image/svg+xml",
+   143→    }.get(suffix)
+   144→
+   145→
+   146→def _image_data_url(data: bytes, mime_type: str) -> str:
+   147→    return f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}"
+   148→
+   149→
+   150→def _path_from_file_uri(uri: str) -> Path | None:
+   151→    """Convert local file URIs/paths from ACP clients into a readable Path.
+   152→
+   153→    Zed may send POSIX file URIs from Linux/WSL workspaces or Windows-ish paths
+   154→    when launched through wsl.exe. Translate the common Windows drive form to
+   155→    /mnt/<drive>/... so Hermes running in WSL can read it.
+   156→    """
+   157→    raw = (uri or "").strip()
+   158→    if not raw:
+   159→        return None
+   160→
+   161→    parsed = urlparse(raw)
+   162→    if parsed.scheme and parsed.scheme != "file":
+   163→        return None
+   164→
+   165→    if parsed.scheme == "file":
+   166→        if parsed.netloc and parsed.netloc not in {"", "localhost"}:
+   167→            return None
+   168→        path_text = unquote(parsed.path or "")
+   169→    else:
+   170→        path_text = unquote(raw)
+   171→
+   172→    # file:///C:/Users/... or C:\Users\...
+   173→    if len(path_text) >= 3 and path_text[0] == "/" and path_text[2] == ":" and path_text[1].isalpha():
+   174→        drive = path_text[1].lower()
+   175→        rest = path_text[3:].lstrip("/\\").replace("\\", "/")
+   176→        return Path("/mnt") / drive / rest
+   177→    if len(path_text) >= 2 and path_text[1] == ":" and path_text[0].isalpha():
+   178→        drive = path_text[0].lower()
+   179→        rest = path_text[2:].lstrip("/\\").replace("\\", "/")
+   180→        return Path("/mnt") / drive / rest
+   181→
+   182→    return Path(path_text)
+   183→
+   184→
+   185→def _decode_text_bytes(data: bytes, mime_type: str | None) -> str | None:
+   186→    """Decode resource bytes if they are probably text; return None for binary."""
+   187→    if b"\x00" in data and not _is_text_resource(mime_type):
+   188→        return None
+   189→    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+   190→        try:
+   191→            return data.decode(encoding)
+   192→        except UnicodeDecodeError:
+   193→            continue
+   194→    return data.decode("utf-8", errors="replace")
+   195→
+   196→
+   197→def _format_resource_text(
+   198→    *,
+   199→    uri: str,
+   200→    body: str,
+   201→    name: str | None = None,
+   202→    title: str | None = None,
+   203→    note: str | None = None,
+   204→) -> str:
+   205→    display = _resource_display_name(uri, name=name, title=title)
+   206→    header = f"[Attached file: {display}]"
+   207→    if note:
+   208→        header += f" ({note})"
+   209→    return f"{header}\nURI: {uri}\n\n{body}"
+   210→
+   211→
+   212→def _resource_link_to_parts(block: ResourceContentBlock) -> list[dict[str, Any]]:
+   213→    """Convert an ACP resource_link block to OpenAI content parts.
+   214→
+   215→    Returns a list of {"type": "text", ...} and/or {"type": "image_url", ...}
+   216→    parts. Image resources produce an image_url part with a small text header
+   217→    so the model knows which attachment it is. Non-image resources return a
+   218→    single text part with the inlined file body (or a binary-omit note).
+   219→    """
+   220→    uri = str(getattr(block, "uri", "") or "").strip()
+   221→    if not uri:
+   222→        return []
+   223→
+   224→    name = str(getattr(block, "name", "") or "").strip() or None
+   225→    title = str(getattr(block, "title", "") or "").strip() or None
+   226→    mime_type = str(getattr(block, "mime_type", "") or "").strip() or None
+   227→    path = _path_from_file_uri(uri)
+   228→
+   229→    if path is None:
+   230→        return [{
+   231→            "type": "text",
+   232→            "text": _format_resource_text(
+   233→                uri=uri,
+   234→                name=name,
+   235→                title=title,
+   236→                body="[Resource link only; Hermes cannot read non-file ACP resource URIs directly.]",
+   237→            ),
+   238→        }]
+   239→
+   240→    # Image files: emit a short text header + image_url data URL so vision
+   241→    # models can see the attachment instead of a "binary omitted" note.
+   242→    image_mime = mime_type if _is_image_resource(mime_type) else _guess_image_mime_from_path(path)
+   243→    if image_mime and _is_image_resource(image_mime):
+   244→        try:
+   245→            size = path.stat().st_size
+   246→            if size > _MAX_ACP_RESOURCE_BYTES:
+   247→                return [{
+   248→                    "type": "text",
+   249→                    "text": _format_resource_text(
+   250→                        uri=uri,
+   251→                        name=name,
+   252→                        title=title,
+   253→                        body=f"[Image too large to inline: {size} bytes, cap={_MAX_ACP_RESOURCE_BYTES}]",
+   254→                    ),
+   255→                }]
+   256→            with path.open("rb") as fh:
+   257→                data = fh.read()
+   258→        except OSError as exc:
+   259→            logger.warning("ACP image resource read failed: %s", uri, exc_info=True)
+   260→            return [{
+   261→                "type": "text",
+   262→                "text": _format_resource_text(
+   263→                    uri=uri,
+   264→                    name=name,
+   265→                    title=title,
+   266→                    body=f"[Could not read attached image: {exc}]",
+   267→                ),
+   268→            }]
+   269→        display = _resource_display_name(uri, name=name, title=title)
+   270→        return [
+   271→            {"type": "text", "text": f"[Attached image: {display}]\nURI: {uri}"},
+   272→            {"type": "image_url", "image_url": {"url": _image_data_url(data, image_mime)}},
+   273→        ]
+   274→
+   275→    try:
+   276→        size = path.stat().st_size
+   277→        read_size = min(size, _MAX_ACP_RESOURCE_BYTES)
+   278→        with path.open("rb") as fh:
+   279→            data = fh.read(read_size)
+   280→        text = _decode_text_bytes(data, mime_type)
+   281→        if text is None:
+   282→            return [{
+   283→                "type": "text",
+   284→                "text": _format_resource_text(
+   285→                    uri=uri,
+   286→                    name=name,
+   287→                    title=title,
+   288→                    body=f"[Binary file omitted: {size} bytes, mime={mime_type or 'unknown'}]",
+   289→                ),
+   290→            }]
+   291→        note = None
+   292→        if size > _MAX_ACP_RESOURCE_BYTES:
+   293→            note = f"truncated to {_MAX_ACP_RESOURCE_BYTES} of {size} bytes"
+   294→        return [{
+   295→            "type": "text",
+   296→            "text": _format_resource_text(uri=uri, name=name, title=title, body=text, note=note),
+   297→        }]
+   298→    except OSError as exc:
+   299→        logger.warning("ACP resource read failed: %s", uri, exc_info=True)
+   300→        return [{
+   301→            "type": "text",
+   302→            "text": _format_resource_text(
+   303→                uri=uri,
+   304→                name=name,
+   305→                title=title,
+   306→                body=f"[Could not read attached file: {exc}]",
+   307→            ),
+   308→        }]
+   309→
+   310→
+   311→def _embedded_resource_to_parts(block: EmbeddedResourceContentBlock) -> list[dict[str, Any]]:
+   312→    resource = getattr(block, "resource", None)
+   313→    if resource is None:
+   314→        return []
+   315→
+   316→    uri = str(getattr(resource, "uri", "") or "").strip()
+   317→    mime_type = str(getattr(resource, "mime_type", "") or "").strip() or None
+   318→
+   319→    if isinstance(resource, TextResourceContents):
+   320→        return [{"type": "text", "text": _format_resource_text(uri=uri, body=resource.text)}]
+   321→
+   322→    if isinstance(resource, BlobResourceContents):
+   323→        blob = resource.blob or ""
+   324→        try:
+   325→            data = base64.b64decode(blob, validate=True)
+   326→        except Exception:
+   327→            data = blob.encode("utf-8", errors="replace")
+   328→
+   329→        # Image blobs go through as image_url so vision models can see them.
+   330→        if _is_image_resource(mime_type):
+   331→            if len(data) > _MAX_ACP_RESOURCE_BYTES:
+   332→                return [{
+   333→                    "type": "text",
+   334→                    "text": _format_resource_text(
+   335→                        uri=uri,
+   336→                        body=f"[Embedded image too large to inline: {len(data)} bytes, cap={_MAX_ACP_RESOURCE_BYTES}]",
+   337→                    ),
+   338→                }]
+   339→            display = _resource_display_name(uri)
+   340→            return [
+   341→                {"type": "text", "text": f"[Attached image: {display}]" + (f"\nURI: {uri}" if uri else "")},
+   342→                {"type": "image_url", "image_url": {"url": _image_data_url(data, mime_type or "image/png")}},
+   343→            ]
+   344→
+   345→        text = _decode_text_bytes(data[:_MAX_ACP_RESOURCE_BYTES], mime_type)
+   346→        if text is None:
+   347→            body = f"[Binary embedded file omitted: {len(data)} bytes, mime={mime_type or 'unknown'}]"
+   348→        else:
+   349→            body = text
+   350→            if len(data) > _MAX_ACP_RESOURCE_BYTES:
+   351→                body += f"\n\n[Truncated to {_MAX_ACP_RESOURCE_BYTES} of {len(data)} bytes]"
+   352→        return [{"type": "text", "text": _format_resource_text(uri=uri, body=body)}]
+   353→
+   354→    text = getattr(resource, "text", None)
+   355→    if text:
+   356→        return [{"type": "text", "text": _format_resource_text(uri=uri, body=str(text))}]
+   357→    return []
+   358→
+   359→
+   360→def _extract_text(
+   361→    prompt: list[
+   362→        TextContentBlock
+   363→        | ImageContentBlock
+   364→        | AudioContentBlock
+   365→        | ResourceContentBlock
+   366→        | EmbeddedResourceContentBlock
+   367→    ],
+   368→) -> str:
+   369→    """Extract plain text from ACP content blocks for display/commands."""
+   370→    parts: list[str] = []
+   371→    for block in prompt:
+   372→        if isinstance(block, TextContentBlock):
+   373→            parts.append(block.text)
+   374→        elif hasattr(block, "text"):
+   375→            parts.append(str(block.text))
+   376→    return "\n".join(parts)
+   377→
+   378→
+   379→def _image_block_to_openai_part(block: ImageContentBlock) -> dict[str, Any] | None:
+   380→    """Convert an ACP image content block to OpenAI-style multimodal content."""
+   381→    data = str(getattr(block, "data", "") or "").strip()
+   382→    uri = str(getattr(block, "uri", "") or "").strip()
+   383→    mime_type = str(getattr(block, "mime_type", "") or "image/png").strip() or "image/png"
+   384→
+   385→    if data:
+   386→        url = data if data.startswith("data:") else f"data:{mime_type};base64,{data}"
+   387→    elif uri:
+   388→        url = uri
+   389→    else:
+   390→        return None
+   391→
+   392→    return {"type": "image_url", "image_url": {"url": url}}
+   393→
+   394→
+   395→def _content_blocks_to_openai_user_content(
+   396→    prompt: list[
+   397→        TextContentBlock
+   398→        | ImageContentBlock
+   399→        | AudioContentBlock
+   400→        | ResourceContentBlock
+   401→        | EmbeddedResourceContentBlock
+   402→    ],
+   403→) -> str | list[dict[str, Any]]:
+   404→    """Convert ACP prompt blocks into a Hermes/OpenAI-compatible user content payload."""
+   405→    parts: list[dict[str, Any]] = []
+   406→    text_parts: list[str] = []
+   407→
+   408→    for block in prompt:
+   409→        if isinstance(block, TextContentBlock):
+   410→            if block.text:
+   411→                parts.append({"type": "text", "text": block.text})
+   412→                text_parts.append(block.text)
+   413→            continue
+   414→        if isinstance(block, ImageContentBlock):
+   415→            image_part = _image_block_to_openai_part(block)
+   416→            if image_part is not None:
+   417→                parts.append(image_part)
+   418→            continue
+   419→        if isinstance(block, ResourceContentBlock):
+   420→            resource_parts = _resource_link_to_parts(block)
+   421→            for part in resource_parts:
+   422→                parts.append(part)
+   423→                if part.get("type") == "text":
+   424→                    text_parts.append(part["text"])
+   425→            continue
+   426→        if isinstance(block, EmbeddedResourceContentBlock):
+   427→            resource_parts = _embedded_resource_to_parts(block)
+   428→            for part in resource_parts:
+   429→                parts.append(part)
+   430→                if part.get("type") == "text":
+   431→                    text_parts.append(part["text"])
+   432→            continue
+   433→
+   434→    if not parts:
+   435→        return _extract_text(prompt)
+   436→
+   437→    # Keep pure text prompts as strings so slash-command handling and text-only
+   438→    # providers keep the exact legacy path. Switch to structured content only
+   439→    # when an actual non-text block is present.
+   440→    if all(part.get("type") == "text" for part in parts):
+   441→        return "\n".join(text_parts)
+   442→
+   443→    return parts
+   444→
+   445→
+   446→class HermesACPAgent(acp.Agent):
+   447→    """ACP Agent implementation wrapping Hermes AIAgent."""
+   448→
+   449→    _SLASH_COMMANDS = {
+   450→        "help": "Show available commands",
+   451→        "model": "Show or change current model",
+   452→        "tools": "List available tools",
+   453→        "context": "Show conversation context info",
+   454→        "reset": "Clear conversation history",
+   455→        "compact": "Compress conversation context",
+   456→        "steer": "Inject guidance into the currently running agent turn",
+   457→        "queue": "Queue a prompt to run after the current turn finishes",
+   458→        "version": "Show Hermes version",
+   459→    }
+   460→
+   461→    _ADVERTISED_COMMANDS = (
+   462→        {
+   463→            "name": "help",
+   464→            "description": "List available commands",
+   465→        },
+   466→        {
+   467→            "name": "model",
+   468→            "description": "Show current model and provider, or switch models",
+   469→            "input_hint": "model name to switch to",
+   470→        },
+   471→        {
+   472→            "name": "tools",
+   473→            "description": "List available tools with descriptions",
+   474→        },
+   475→        {
+   476→            "name": "context",
+   477→            "description": "Show conversation message counts by role",
+   478→        },
+   479→        {
+   480→            "name": "reset",
+   481→            "description": "Clear conversation history",
+   482→        },
+   483→        {
+   484→            "name": "compact",
+   485→            "description": "Compress conversation context",
+   486→        },
+   487→        {
+   488→            "name": "steer",
+   489→            "description": "Inject guidance into the currently running agent turn",
+   490→            "input_hint": "guidance for the active turn",
+   491→        },
+   492→        {
+   493→            "name": "queue",
+   494→            "description": "Queue a prompt to run after the current turn finishes",
+   495→            "input_hint": "prompt to run next",
+   496→        },
+   497→        {
+   498→            "name": "version",
+   499→            "description": "Show Hermes version",
+   500→        },
+   501→    )
+   502→
+   503→    _EDIT_APPROVAL_POLICY_CONFIG_ID = "edit_approval_policy"
+   504→    _EDIT_APPROVAL_POLICY_DEFAULT = "ask"
+   505→    _MODE_DEFAULT = "default"
+   506→    _MODE_ACCEPT_EDITS = "accept_edits"
+   507→    _MODE_DONT_ASK = "dont_ask"
+   508→    _MODE_TO_EDIT_APPROVAL_POLICY = {
+   509→        _MODE_DEFAULT: "ask",
+   510→        _MODE_ACCEPT_EDITS: "workspace_session",
+   511→        _MODE_DONT_ASK: "session",
+   512→    }
+   513→    _EDIT_APPROVAL_POLICY_TO_MODE = {
+   514→        value: key for key, value in _MODE_TO_EDIT_APPROVAL_POLICY.items()
+   515→    }
+   516→
+   517→    def __init__(self, session_manager: SessionManager | None = None):
+   518→        super().__init__()
+   519→        self.session_manager = session_manager or SessionManager()
+   520→        self._conn: Optional[acp.Client] = None
+   521→
+   522→    # ---- Connection lifecycle -----------------------------------------------
+   523→
+   524→    def on_connect(self, conn: acp.Client) -> None:
+   525→        """Store the client connection for sending session updates."""
+   526→        self._conn = conn
+   527→        logger.info("ACP client connected")
+   528→
+   529→
+   530→    def _session_modes(self, state: SessionState) -> SessionModeState:
+   531→        """Return ACP session modes while preserving Zed's separate model picker.
+   532→
+   533→        Zed renders ``config_options`` in the prominent selector slot where the
+   534→        model picker was visible. Claude/Codex expose policy-like controls as ACP
+   535→        modes, which coexist with the model picker, so Hermes maps edit approval
+   536→        policy onto modes instead of advertising config options.
+   537→        """
+   538→
+   539→        current = str(getattr(state, "mode", "") or self._MODE_DEFAULT)
+   540→        if current not in self._MODE_TO_EDIT_APPROVAL_POLICY:
+   541→            current = self._MODE_DEFAULT
+   542→        return SessionModeState(
+   543→            current_mode_id=current,
+   544→            available_modes=[
+   545→                SessionMode(
+   546→                    id=self._MODE_DEFAULT,
+   547→                    name="Default",
+   548→                    description="Ask before edits.",
+   549→                ),
+   550→                SessionMode(
+   551→                    id=self._MODE_ACCEPT_EDITS,
+   552→                    name="Accept Edits",
+   553→                    description="Auto-allow workspace and /tmp edits; still asks for sensitive paths.",
+   554→                ),
+   555→                SessionMode(
+   556→                    id=self._MODE_DONT_ASK,
+   557→                    name="Don't Ask",
+   558→                    description="Auto-allow file edits for this session except sensitive paths.",
+   559→                ),
+   560→            ],
+   561→        )
+   562→
+   563→    def _edit_approval_policy_for_state(self, state: SessionState) -> tuple[str, str | None]:
+   564→        mode = str(getattr(state, "mode", "") or self._MODE_DEFAULT)
+   565→        policy = self._MODE_TO_EDIT_APPROVAL_POLICY.get(mode, self._EDIT_APPROVAL_POLICY_DEFAULT)
+   566→        return policy, state.cwd
+   567→
+   568→    @staticmethod
+   569→    def _encode_model_choice(provider: str | None, model: str | None) -> str:
+   570→        """Encode a model selection so ACP clients can keep provider context."""
+   571→        raw_model = str(model or "").strip()
+   572→        if not raw_model:
+   573→            return ""
+   574→        raw_provider = str(provider or "").strip().lower()
+   575→        if not raw_provider:
+   576→            return raw_model
+   577→        return f"{raw_provider}:{raw_model}"
+   578→
+   579→    def _build_model_state(self, state: SessionState) -> SessionModelState | None:
+   580→        """Return the ACP model selector payload for editors like Zed."""
+   581→        model = str(state.model or getattr(state.agent, "model", "") or "").strip()
+   582→        provider = getattr(state.agent, "provider", None) or detect_provider() or "openrouter"
+   583→
+   584→        try:
+   585→            from hermes_cli.models import curated_models_for_provider, normalize_provider, provider_label
+   586→
+   587→            normalized_provider = normalize_provider(provider)
+   588→            provider_name = provider_label(normalized_provider)
+   589→            available_models: list[ModelInfo] = []
+   590→            seen_ids: set[str] = set()
+   591→
+   592→            for model_id, description in curated_models_for_provider(normalized_provider):
+   593→                rendered_model = str(model_id or "").strip()
+   594→                if not rendered_model:
+   595→                    continue
+   596→                choice_id = self._encode_model_choice(normalized_provider, rendered_model)
+   597→                if choice_id in seen_ids:
+   598→                    continue
+   599→                desc_parts = [f"Provider: {provider_name}"]
+   600→                if description:
+   601→                    desc_parts.append(str(description).strip())
+   602→                if rendered_model == model:
+   603→                    desc_parts.append("current")
+   604→                available_models.append(
+   605→                    ModelInfo(
+   606→                        model_id=choice_id,
+   607→                        name=rendered_model,
+   608→                        description=" • ".join(part for part in desc_parts if part),
+   609→                    )
+   610→                )
+   611→                seen_ids.add(choice_id)
+   612→
+   613→            current_model_id = self._encode_model_choice(normalized_provider, model)
+   614→            if current_model_id and current_model_id not in seen_ids:
+   615→                available_models.insert(
+   616→                    0,
+   617→                    ModelInfo(
+   618→                        model_id=current_model_id,
+   619→                        name=model,
+   620→                        description=f"Provider: {provider_name} • current",
+   621→                    ),
+   622→                )
+   623→
+   624→            if available_models:
+   625→                return SessionModelState(
+   626→                    available_models=available_models,
+   627→                    current_model_id=current_model_id or available_models[0].model_id,
+   628→                )
+   629→        except Exception:
+   630→            logger.debug("Could not build ACP model state", exc_info=True)
+   631→
+   632→        if not model:
+   633→            return None
+   634→
+   635→        fallback_choice = self._encode_model_choice(provider, model)
+   636→        return SessionModelState(
+   637→            available_models=[ModelInfo(model_id=fallback_choice, name=model)],
+   638→            current_model_id=fallback_choice,
+   639→        )
+   640→
+   641→    @staticmethod
+   642→    def _resolve_model_selection(raw_model: str, current_provider: str) -> tuple[str, str]:
+   643→        """Resolve ``provider:model`` input into the provider and normalized model id."""
+   644→        target_provider = current_provider
+   645→        new_model = raw_model.strip()
+   646→
+   647→        try:
+   648→            from hermes_cli.models import detect_provider_for_model, parse_model_input
+   649→
+   650→            target_provider, new_model = parse_model_input(new_model, current_provider)
+   651→            if target_provider == current_provider:
+   652→                detected = detect_provider_for_model(new_model, current_provider)
+   653→                if detected:
+   654→                    target_provider, new_model = detected
+   655→        except Exception:
+   656→            logger.debug("Provider detection failed, using model as-is", exc_info=True)
+   657→
+   658→        return target_provider, new_model
+   659→
+   660→    @staticmethod
+   661→    def _build_usage_update(state: SessionState) -> UsageUpdate | None:
+   662→        """Build ACP native context-usage data for clients like Zed.
+   663→
+   664→        Zed's circular context indicator is driven by ACP ``usage_update``
+   665→        session updates: ``size`` is the model context window and ``used`` is
+   666→        the current request pressure.  Hermes estimates ``used`` from the same
+   667→        buckets it sends to providers: system prompt, conversation history, and
+   668→        tool schemas.
+   669→        """
+   670→        agent = state.agent
+   671→        compressor = getattr(agent, "context_compressor", None)
+   672→        size = int(getattr(compressor, "context_length", 0) or 0)
+   673→        if size <= 0:
+   674→            return None
+   675→
+   676→        try:
+   677→            from agent.model_metadata import estimate_request_tokens_rough
+   678→
+   679→            used = estimate_request_tokens_rough(
+   680→                state.history,
+   681→                system_prompt=getattr(agent, "_cached_system_prompt", "") or "",
+   682→                tools=getattr(agent, "tools", None) or None,
+   683→            )
+   684→        except Exception:
+   685→            logger.debug("Could not estimate ACP native context usage", exc_info=True)
+   686→            used = int(getattr(compressor, "last_prompt_tokens", 0) or 0)
+   687→
+   688→        return UsageUpdate(
+   689→            session_update="usage_update",
+   690→            size=max(size, 0),
+   691→            used=max(used, 0),
+   692→        )
+   693→
+   694→    async def _send_usage_update(self, state: SessionState) -> None:
+   695→        """Send ACP native context usage to the connected client."""
+   696→        if not self._conn:
+   697→            return
+   698→        update = self._build_usage_update(state)
+   699→        if update is None:
+   700→            return
+   701→        try:
+   702→            await self._conn.session_update(
+   703→                session_id=state.session_id,
+   704→                update=update,
+   705→            )
+   706→        except Exception:
+   707→            logger.warning(
+   708→                "Failed to send ACP usage update for session %s",
+   709→                state.session_id,
+   710→                exc_info=True,
+   711→            )
+   712→
+   713→    def _provenance_meta(
+   714→        self,
+   715→        acp_session_id: str,
+   716→        current_hermes_session_id: str,
+   717→        previous_hermes_session_id: Optional[str] = None,
+   718→    ) -> Optional[dict]:
+   719→        """Best-effort ``_meta.hermes.sessionProvenance`` for an ACP session."""
+   720→        try:
+   721→            return session_provenance_meta(
+   722→                self.session_manager._get_db(),
+   723→                acp_session_id,
+   724→                current_hermes_session_id,
+   725→                previous_hermes_session_id=previous_hermes_session_id,
+   726→            )
+   727→        except Exception:
+   728→            logger.debug(
+   729→                "Could not build ACP session provenance for %s", acp_session_id, exc_info=True
+   730→            )
+   731→            return None
+   732→
+   733→    async def _send_session_info_update(
+   734→        self,
+   735→        session_id: str,
+   736→        *,
+   737→        current_hermes_session_id: Optional[str] = None,
+   738→        previous_hermes_session_id: Optional[str] = None,
+   739→    ) -> None:
+   740→        """Send ACP native session metadata after Hermes changes it.
+   741→
+   742→        When the internal Hermes head rotated (e.g. compression-driven session
+   743→        split during a turn), pass ``previous_hermes_session_id`` so the
+   744→        attached ``_meta.hermes.sessionProvenance`` flags the rotation reason.
+   745→        """
+   746→        if not self._conn:
+   747→            return
+   748→        try:
+   749→            row = self.session_manager._get_db().get_session(session_id)
+   750→        except Exception:
+   751→            logger.debug("Could not read ACP session info for %s", session_id, exc_info=True)
+   752→            return
+   753→        if not row:
+   754→            return
+   755→
+   756→        title = row.get("title")
+   757→        # The `sessions` table does not have an `updated_at` column (see
+   758→        # hermes_state.py schema — only started_at/ended_at). Use "now" as
+   759→        # the updated_at since we're emitting this notification precisely
+   760→        # because the title was just refreshed.
+   761→        updated_at = datetime.now(timezone.utc).isoformat()
+   762→        meta = self._provenance_meta(
+   763→            session_id,
+   764→            current_hermes_session_id or session_id,
+   765→            previous_hermes_session_id,
+   766→        )
+   767→        update = SessionInfoUpdate(
+   768→            session_update="session_info_update",
+   769→            title=title if isinstance(title, str) and title.strip() else None,
+   770→            updated_at=updated_at,
+   771→            field_meta=meta,
+   772→        )
+   773→        try:
+   774→            await self._conn.session_update(
+   775→                session_id=session_id,
+   776→                update=update,
+   777→            )
+   778→        except Exception:
+   779→            logger.debug("Could not send ACP session info update for %s", session_id, exc_info=True)
+   780→
+   781→    def _schedule_usage_update(self, state: SessionState) -> None:
+   782→        """Schedule native context indicator refresh after ACP responses."""
+   783→        if not self._conn:
+   784→            return
+   785→        loop = asyncio.get_running_loop()
+   786→        loop.call_soon(asyncio.create_task, self._send_usage_update(state))
+   787→
+   788→    async def _register_session_mcp_servers(
+   789→        self,
+   790→        state: SessionState,
+   791→        mcp_servers: list[McpServerStdio | McpServerHttp | McpServerSse] | None,
+   792→    ) -> None:
+   793→        """Register ACP-provided MCP servers and refresh the agent tool surface."""
+   794→        if not mcp_servers:
+   795→            return
+   796→
+   797→        try:
+   798→            from tools.mcp_tool import register_mcp_servers
+   799→
+   800→            config_map: dict[str, dict] = {}
+   801→            for server in mcp_servers:
+   802→                name = server.name
+   803→                if isinstance(server, McpServerStdio):
+   804→                    config = {
+   805→                        "command": server.command,
+   806→                        "args": list(server.args),
+   807→                        "env": {item.name: item.value for item in server.env},
+   808→                    }
+   809→                else:
+   810→                    config = {
+   811→                        "url": server.url,
+   812→                        "headers": {item.name: item.value for item in server.headers},
+   813→                    }
+   814→                config_map[name] = config
+   815→
+   816→            await asyncio.to_thread(register_mcp_servers, config_map)
+   817→        except Exception:
+   818→            logger.warning(
+   819→                "Session %s: failed to register ACP MCP servers",
+   820→                state.session_id,
+   821→                exc_info=True,
+   822→            )
+   823→            return
+   824→
+   825→        try:
+   826→            from model_tools import get_tool_definitions
+   827→            from agent.memory_manager import inject_memory_provider_tools
+   828→
+   829→            enabled_toolsets = _expand_acp_enabled_toolsets(
+   830→                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"],
+   831→                mcp_server_names=[server.name for server in mcp_servers],
+   832→            )
+   833→            state.agent.enabled_toolsets = enabled_toolsets
+   834→            disabled_toolsets = getattr(state.agent, "disabled_toolsets", None)
+   835→            state.agent.tools = get_tool_definitions(
+   836→                enabled_toolsets=enabled_toolsets,
+   837→                disabled_toolsets=disabled_toolsets,
+   838→                quiet_mode=True,
+   839→            )
+   840→            state.agent.valid_tool_names = {
+   841→                tool["function"]["name"] for tool in state.agent.tools or []
+   842→            }
+   843→            inject_memory_provider_tools(state.agent)
+   844→            invalidate = getattr(state.agent, "_invalidate_system_prompt", None)
+   845→            if callable(invalidate):
+   846→                invalidate()
+   847→            logger.info(
+   848→                "Session %s: refreshed tool surface after ACP MCP registration (%d tools)",
+   849→                state.session_id,
+   850→                len(state.agent.tools or []),
+   851→            )
+   852→        except Exception:
+   853→            logger.warning(
+   854→                "Session %s: failed to refresh tool surface after ACP MCP registration",
+   855→                state.session_id,
+   856→                exc_info=True,
+   857→            )
+   858→
+   859→    # ---- ACP lifecycle ------------------------------------------------------
+   860→
+   861→    async def initialize(
+   862→        self,
+   863→        protocol_version: int | None = None,
+   864→        client_capabilities: ClientCapabilities | None = None,
+   865→        client_info: Implementation | None = None,
+   866→        **kwargs: Any,
+   867→    ) -> InitializeResponse:
+   868→        resolved_protocol_version = (
+   869→            protocol_version if isinstance(protocol_version, int) else acp.PROTOCOL_VERSION
+   870→        )
+   871→        auth_methods = build_auth_methods()
+   872→
+   873→        client_name = client_info.name if client_info else "unknown"
+   874→        logger.info(
+   875→            "Initialize from %s (protocol v%s)",
+   876→            client_name,
+   877→            resolved_protocol_version,
+   878→        )
+   879→
+   880→        return InitializeResponse(
+   881→            protocol_version=acp.PROTOCOL_VERSION,
+   882→            agent_info=Implementation(name="hermes-agent", version=HERMES_VERSION),
+   883→            agent_capabilities=AgentCapabilities(
+   884→                load_session=True,
+   885→                prompt_capabilities=PromptCapabilities(image=True),
+   886→                session_capabilities=SessionCapabilities(
+   887→                    fork=SessionForkCapabilities(),
+   888→                    list=SessionListCapabilities(),
+   889→                    resume=SessionResumeCapabilities(),
+   890→                ),
+   891→            ),
+   892→            auth_methods=auth_methods,
+   893→        )
+   894→
+   895→    async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse | None:
+   896→        # Only accept authenticate() calls whose method_id matches the
+   897→        # provider we advertised in initialize(). Without this check,
+   898→        # authenticate() would acknowledge any method_id as long as the
+   899→        # server has provider credentials configured — harmless under
+   900→        # Hermes' threat model (ACP is stdio-only, local-trust), but poor
+   901→        # API hygiene and confusing if ACP ever grows multi-method auth.
+   902→        if not isinstance(method_id, str):
+   903→            return None
+   904→        normalized_method = method_id.strip().lower()
+   905→        provider = detect_provider()
+   906→
+   907→        if normalized_method == TERMINAL_SETUP_AUTH_METHOD_ID:
+   908→            # Terminal auth launches Hermes setup/model selection out-of-band.
+   909→            # Only report success once that flow has produced usable runtime
+   910→            # credentials for the normal ACP session.
+   911→            return AuthenticateResponse() if provider else None
+   912→
+   913→        if not provider or normalized_method != provider:
+   914→            return None
+   915→        return AuthenticateResponse()
+   916→
+   917→    # ---- Session management -------------------------------------------------
+   918→
+   919→    @staticmethod
+   920→    def _flatten_history_text(value: Any) -> str:
+   921→        """Normalize a persisted text-or-text-parts value into a single string.
+   922→
+   923→        OpenAI-style assistant content (and provider reasoning fields) can arrive
+   924→        as either a scalar string or a list of ``{"text": ...}`` /
+   925→        ``{"type": "text", "content": ...}`` parts. Whitespace-only inputs
+   926→        collapse to an empty string so callers can treat ``""`` as "nothing to
+   927→        emit".
+   928→        """
+   929→        if isinstance(value, str):
+   930→            return value.strip()
+   931→        if isinstance(value, list):
+   932→            parts: list[str] = []
+   933→            for item in value:
+   934→                if isinstance(item, dict):
+   935→                    text = item.get("text")
+   936→                    if isinstance(text, str):
+   937→                        parts.append(text)
+   938→                    elif item.get("type") == "text" and isinstance(item.get("content"), str):
+   939→                        parts.append(item["content"])
+   940→                elif isinstance(item, str):
+   941→                    parts.append(item)
+   942→            return "\n".join(part.strip() for part in parts if part and part.strip()).strip()
+   943→        return ""
+   944→
+   945→    @classmethod
+   946→    def _history_message_text(cls, message: dict[str, Any]) -> str:
+   947→        """Extract displayable text from a persisted OpenAI-style message."""
+   948→        return cls._flatten_history_text(message.get("content"))
+   949→
+   950→    @classmethod
+   951→    def _history_reasoning_text(cls, message: dict[str, Any]) -> str:
+   952→        """Extract displayable reasoning/thought text from a persisted assistant message.
+   953→
+   954→        Returns the first non-empty value among ``reasoning_content`` (the
+   955→        canonical field used by DeepSeek / Moonshot and the post-#16892
+   956→        chat-completions normalizer) and ``reasoning`` (used by the codex
+   957→        event projector and several other transports). Both keys are
+   958→        actively written by live code paths, so neither branch is
+   959→        deprecated — they cover different transports rather than old vs.
+   960→        new sessions.
+   961→        """
+   962→        for key in ("reasoning_content", "reasoning"):
+   963→            text = cls._flatten_history_text(message.get(key))
+   964→            if text:
+   965→                return text
+   966→        return ""
+   967→
+   968→    @staticmethod
+   969→    def _history_message_update(
+   970→        *,
+   971→        role: str,
+   972→        text: str,
+   973→    ) -> UserMessageChunk | AgentMessageChunk | None:
+   974→        """Build an ACP history replay update for a user/assistant message."""
+   975→        block = TextContentBlock(type="text", text=text)
+   976→        if role == "user":
+   977→            return UserMessageChunk(
+   978→                session_update="user_message_chunk",
+   979→                content=block,
+   980→            )
+   981→        if role == "assistant":
+   982→            return AgentMessageChunk(
+   983→                session_update="agent_message_chunk",
+   984→                content=block,
+   985→            )
+   986→        return None
+   987→
+   988→    @staticmethod
+   989→    def _history_thought_update(text: str) -> AgentThoughtChunk:
+   990→        """Build an ACP history replay update for an assistant thought."""
+   991→        return acp.update_agent_thought_text(text)
+   992→
+   993→    @staticmethod
+   994→    def _history_tool_call_name_args(tool_call: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+   995→        """Extract function name/arguments from an OpenAI-style tool_call."""
+   996→        function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+   997→        name = str(function.get("name") or tool_call.get("name") or "unknown_tool")
+   998→        raw_args = function.get("arguments") or tool_call.get("arguments") or tool_call.get("args") or {}
+   999→        if isinstance(raw_args, str):
+  1000→            try:
+  1001→                parsed = json.loads(raw_args)
+  1002→            except Exception:
+  1003→                parsed = {"raw": raw_args}
+  1004→            raw_args = parsed
+  1005→        if not isinstance(raw_args, dict):
+  1006→            raw_args = {}
+  1007→        return name, raw_args
+  1008→
+  1009→    @staticmethod
+  1010→    def _history_tool_call_id(tool_call: dict[str, Any]) -> str:
+  1011→        """Return the stable provider tool call id for ACP history replay."""
+  1012→        return str(
+  1013→            tool_call.get("id")
+  1014→            or tool_call.get("call_id")
+  1015→            or tool_call.get("tool_call_id")
+  1016→            or ""
+  1017→        ).strip()
+  1018→
+  1019→    async def _replay_session_history(self, state: SessionState) -> None:
+  1020→        """Replay persisted user/assistant history during session/load or session/resume.
+  1021→
+  1022→        Invoked inline (``await``) from both ``load_session`` and
+  1023→        ``resume_session`` so that spec-compliant ACP clients receive the
+  1024→        full transcript within the request's lifetime — see the comment at
+  1025→        the call sites for the rationale and prior-art citations.
+  1026→
+  1027→        Replays the conversation as user/assistant chunks, thinking-mode
+  1028→        thought chunks, plus reconstructed tool-call start/completion
+  1029→        notifications. Merely restoring server-side state makes Hermes
+  1030→        remember context, but leaves the editor looking like a clean thread.
+  1031→        """
+  1032→        if not self._conn or not state.history:
+  1033→            return
+  1034→
+  1035→        active_tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
+  1036→
+  1037→        async def _send(update: Any) -> bool:
+  1038→            try:
+  1039→                await self._conn.session_update(session_id=state.session_id, update=update)
+  1040→                return True
+  1041→            except Exception:
+  1042→                logger.warning(
+  1043→                    "Failed to replay ACP history for session %s",
+  1044→                    state.session_id,
+  1045→                    exc_info=True,
+  1046→                )
+  1047→                return False
+  1048→
+  1049→        for message in state.history:
+  1050→            role = str(message.get("role") or "")
+  1051→
+  1052→            if role == "user":
+  1053→                text = self._history_message_text(message)
+  1054→                if text:
+  1055→                    update = self._history_message_update(role=role, text=text)
+  1056→                    if update is not None and not await _send(update):
+  1057→                        return
+  1058→                continue
+  1059→
+  1060→            if role == "assistant":
+  1061→                thought = self._history_reasoning_text(message)
+  1062→                if thought and not await _send(self._history_thought_update(thought)):
+  1063→                    return
+  1064→
+  1065→                text = self._history_message_text(message)
+  1066→                if text:
+  1067→                    update = self._history_message_update(role=role, text=text)
+  1068→                    if update is not None and not await _send(update):
+  1069→                        return
+  1070→
+  1071→                tool_calls = message.get("tool_calls")
+  1072→                if isinstance(tool_calls, list):
+  1073→                    for tool_call in tool_calls:
+  1074→                        if not isinstance(tool_call, dict):
+  1075→                            continue
+  1076→                        tool_call_id = self._history_tool_call_id(tool_call)
+  1077→                        if not tool_call_id:
+  1078→                            continue
+  1079→                        tool_name, args = self._history_tool_call_name_args(tool_call)
+  1080→                        active_tool_calls[tool_call_id] = (tool_name, args)
+  1081→                        if not await _send(build_tool_start(tool_call_id, tool_name, args)):
+  1082→                            return
+  1083→                continue
+  1084→
+  1085→            if role == "tool":
+  1086→                tool_call_id = str(message.get("tool_call_id") or "").strip()
+  1087→                tool_name = str(message.get("tool_name") or "").strip()
+  1088→                function_args: dict[str, Any] | None = None
+  1089→                if tool_call_id in active_tool_calls:
+  1090→                    tool_name, function_args = active_tool_calls.pop(tool_call_id)
+  1091→                if not tool_call_id or not tool_name:
+  1092→                    continue
+  1093→                result = message.get("content")
+  1094→                result_text = result if isinstance(result, str) else None
+  1095→                if not await _send(
+  1096→                    build_tool_complete(
+  1097→                        tool_call_id,
+  1098→                        tool_name,
+  1099→                        result=result_text,
+  1100→                        function_args=function_args,
+  1101→                    )
+  1102→                ):
+  1103→                    return
+  1104→                if tool_name == "todo":
+  1105→                    plan_update = _build_plan_update_from_todo_result(result_text)
+  1106→                    if plan_update is not None and not await _send(plan_update):
+  1107→                        return
+  1108→
+  1109→    async def new_session(
+  1110→        self,
+  1111→        cwd: str,
+  1112→        mcp_servers: list | None = None,
+  1113→        **kwargs: Any,
+  1114→    ) -> NewSessionResponse:
+  1115→        state = self.session_manager.create_session(cwd=cwd)
+  1116→        await self._register_session_mcp_servers(state, mcp_servers)
+  1117→        logger.info("New session %s (cwd=%s)", state.session_id, cwd)
+  1118→        self._schedule_available_commands_update(state.session_id)
+  1119→        self._schedule_usage_update(state)
+  1120→        return NewSessionResponse(
+  1121→            session_id=state.session_id,
+  1122→            models=self._build_model_state(state),
+  1123→            modes=self._session_modes(state),
+  1124→            field_meta=self._provenance_meta(
+  1125→                state.session_id, getattr(state.agent, "session_id", state.session_id)
+  1126→            ),
+  1127→        )
+  1128→
+  1129→    async def load_session(
+  1130→        self,
+  1131→        cwd: str,
+  1132→        session_id: str,
+  1133→        mcp_servers: list | None = None,
+  1134→        **kwargs: Any,
+  1135→    ) -> LoadSessionResponse | None:
+  1136→        state = self.session_manager.update_cwd(session_id, cwd)
+  1137→        if state is None:
+  1138→            logger.warning("load_session: session %s not found", session_id)
+  1139→            return None
+  1140→        await self._register_session_mcp_servers(state, mcp_servers)
+  1141→        logger.info("Loaded session %s", session_id)
+  1142→        # Per ACP spec, `session/load` must stream the prior conversation back
+  1143→        # to the client via `session/update` notifications BEFORE responding,
+  1144→        # so the client receives the full transcript within the load request's
+  1145→        # lifetime. Awaiting the replay here matches Codex / Claude Code /
+  1146→        # OpenCode / Pi and the Zed client (which registers the session-update
+  1147→        # routing entry before awaiting the loadSession RPC specifically so
+  1148→        # in-call history replay updates can find the thread). Deferring this
+  1149→        # via `loop.call_soon` (as we did briefly in May 2026) broke every
+  1150→        # spec-compliant ACP client that measures notifications synchronously
+  1151→        # against the load response — see #12285 follow-up.
+  1152→        try:
+  1153→            await self._replay_session_history(state)
+  1154→        except Exception:
+  1155→            # Replay is best-effort — a corrupted or unexpected message shape
+  1156→            # must not turn a successful session/load into a JSON-RPC error
+  1157→            # response. Per-notification failures are already caught inside
+  1158→            # ``_replay_session_history``; this outer guard covers anything
+  1159→            # raised by the helpers themselves before reaching ``_send``.
+  1160→            logger.warning(
+  1161→                "ACP history replay raised during session/load for %s — "
+  1162→                "load will still succeed, partial transcript may be missing",
+  1163→                session_id,
+  1164→                exc_info=True,
+  1165→            )
+  1166→        self._schedule_available_commands_update(session_id)
+  1167→        self._schedule_usage_update(state)
+  1168→        return LoadSessionResponse(
+  1169→            models=self._build_model_state(state),
+  1170→            modes=self._session_modes(state),
+  1171→            field_meta=self._provenance_meta(
+  1172→                session_id, getattr(state.agent, "session_id", session_id)
+  1173→            ),
+  1174→        )
+  1175→
+  1176→    async def resume_session(
+  1177→        self,
+  1178→        cwd: str,
+  1179→        session_id: str,
+  1180→        mcp_servers: list | None = None,
+  1181→        **kwargs: Any,
+  1182→    ) -> ResumeSessionResponse:
+  1183→        state = self.session_manager.update_cwd(session_id, cwd)
+  1184→        if state is None:
+  1185→            logger.warning("resume_session: session %s not found, creating new", session_id)
+  1186→            state = self.session_manager.create_session(cwd=cwd)
+  1187→        await self._register_session_mcp_servers(state, mcp_servers)
+  1188→        logger.info("Resumed session %s", state.session_id)
+  1189→        # See `load_session` above for the spec rationale — replay must
+  1190→        # complete before the response so clients receive the full transcript
+  1191→        # within the request's lifetime.
+  1192→        try:
+  1193→            await self._replay_session_history(state)
+  1194→        except Exception:
+  1195→            logger.warning(
+  1196→                "ACP history replay raised during session/resume for %s — "
+  1197→                "resume will still succeed, partial transcript may be missing",
+  1198→                state.session_id,
+  1199→                exc_info=True,
+  1200→            )
+  1201→        self._schedule_available_commands_update(state.session_id)
+  1202→        self._schedule_usage_update(state)
+  1203→        return ResumeSessionResponse(
+  1204→            models=self._build_model_state(state),
+  1205→            modes=self._session_modes(state),
+  1206→            field_meta=self._provenance_meta(
+  1207→                state.session_id, getattr(state.agent, "session_id", state.session_id)
+  1208→            ),
+  1209→        )
+  1210→
+  1211→    async def cancel(self, session_id: str, **kwargs: Any) -> None:
+  1212→        state = self.session_manager.get_session(session_id)
+  1213→        if state and state.cancel_event:
+  1214→            with state.runtime_lock:
+  1215→                if state.is_running and state.current_prompt_text:
+  1216→                    state.interrupted_prompt_text = state.current_prompt_text
+  1217→            state.cancel_event.set()
+  1218→            try:
+  1219→                if getattr(state, "agent", None) and hasattr(state.agent, "interrupt"):
+  1220→                    state.agent.interrupt()
+  1221→            except Exception:
+  1222→                logger.debug("Failed to interrupt ACP session %s", session_id, exc_info=True)
+  1223→            logger.info("Cancelled session %s", session_id)
+  1224→
+  1225→    async def fork_session(
+  1226→        self,
+  1227→        cwd: str,
+  1228→        session_id: str,
+  1229→        mcp_servers: list | None = None,
+  1230→        **kwargs: Any,
+  1231→    ) -> ForkSessionResponse:
+  1232→        state = self.session_manager.fork_session(session_id, cwd=cwd)
+  1233→        new_id = state.session_id if state else ""
+  1234→        if state is not None:
+  1235→            await self._register_session_mcp_servers(state, mcp_servers)
+  1236→        logger.info("Forked session %s -> %s", session_id, new_id)
+  1237→        if new_id:
+  1238→            self._schedule_available_commands_update(new_id)
+  1239→        return ForkSessionResponse(
+  1240→            session_id=new_id,
+  1241→            models=self._build_model_state(state) if state is not None else None,
+  1242→            modes=self._session_modes(state) if state is not None else None,
+  1243→        )
+  1244→
+  1245→    async def list_sessions(
+  1246→        self,
+  1247→        cursor: str | None = None,
+  1248→        cwd: str | None = None,
+  1249→        **kwargs: Any,
+  1250→    ) -> ListSessionsResponse:
+  1251→        """List ACP sessions with optional ``cwd`` filtering and cursor pagination.
+  1252→
+  1253→        ``cwd`` is passed through to ``SessionManager.list_sessions`` which already
+  1254→        normalizes and filters by working directory. ``cursor`` is a ``session_id``
+  1255→        previously returned as ``next_cursor``; results resume after that entry.
+  1256→        Server-side page size is capped at ``_LIST_SESSIONS_PAGE_SIZE``; when more
+  1257→        results remain, ``next_cursor`` is set to the last returned ``session_id``.
+  1258→        """
+  1259→        infos = self.session_manager.list_sessions(cwd=cwd)
+  1260→
+  1261→        if cursor:
+  1262→            for idx, s in enumerate(infos):
+  1263→                if s["session_id"] == cursor:
+  1264→                    infos = infos[idx + 1:]
+  1265→                    break
+  1266→            else:
+  1267→                # Unknown cursor -> empty page (do not fall back to full list).
+  1268→                infos = []
+  1269→
+  1270→        has_more = len(infos) > _LIST_SESSIONS_PAGE_SIZE
+  1271→        infos = infos[:_LIST_SESSIONS_PAGE_SIZE]
+  1272→
+  1273→        sessions = []
+  1274→        for s in infos:
+  1275→            updated_at = s.get("updated_at")
+  1276→            if updated_at is not None and not isinstance(updated_at, str):
+  1277→                updated_at = str(updated_at)
+  1278→            sessions.append(
+  1279→                SessionInfo(
+  1280→                    session_id=s["session_id"],
+  1281→                    cwd=s["cwd"],
+  1282→                    title=s.get("title"),
+  1283→                    updated_at=updated_at,
+  1284→                )
+  1285→            )
+  1286→
+  1287→        next_cursor = sessions[-1].session_id if has_more and sessions else None
+  1288→        return ListSessionsResponse(sessions=sessions, next_cursor=next_cursor)
+  1289→
+  1290→    # ---- Prompt (core) ------------------------------------------------------
+  1291→
+  1292→    async def prompt(
+  1293→        self,
+  1294→        prompt: list[
+  1295→            TextContentBlock
+  1296→            | ImageContentBlock
+  1297→            | AudioContentBlock
+  1298→            | ResourceContentBlock
+  1299→            | EmbeddedResourceContentBlock
+  1300→        ],
+  1301→        session_id: str,
+  1302→        **kwargs: Any,
+  1303→    ) -> PromptResponse:
+  1304→        """Run Hermes on the user's prompt and stream events back to the editor."""
+  1305→        state = self.session_manager.get_session(session_id)
+  1306→        if state is None:
+  1307→            logger.error("prompt: session %s not found", session_id)
+  1308→            return PromptResponse(stop_reason="refusal")
+  1309→
+  1310→        user_text = _extract_text(prompt).strip()
+  1311→        user_content = _content_blocks_to_openai_user_content(prompt)
+  1312→        text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
+  1313→        has_content = bool(user_text) or (
+  1314→            isinstance(user_content, list) and bool(user_content)
+  1315→        )
+  1316→        if not has_content:
+  1317→            return PromptResponse(stop_reason="end_turn")
+  1318→
+  1319→        # /steer on an idle session has no in-flight tool call to inject into.
+  1320→        # Rewrite it so the payload runs as a normal user prompt, matching the
+  1321→        # gateway's behavior (gateway/run.py ~L4898). Two sub-cases:
+  1322→        #   1. Zed-interrupt salvage — a prior prompt was cancelled by the
+  1323→        #      client right before /steer arrived; replay it with the steer
+  1324→        #      text attached as explicit correction/guidance so the user's
+  1325→        #      in-flight work isn't lost.
+  1326→        #   2. Plain idle — no prior work to salvage; just run the steer
+  1327→        #      payload as a regular prompt. Without this, _cmd_steer would
+  1328→        #      silently append to state.queued_prompts and respond with
+  1329→        #      "No active turn — queued for the next turn", which looks like
+  1330→        #      /queue even though the user never typed /queue.
+  1331→        if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/steer"):
+  1332→            steer_text = user_text.split(maxsplit=1)[1].strip() if len(user_text.split(maxsplit=1)) > 1 else ""
+  1333→            interrupted_prompt = ""
+  1334→            rewrite_idle = False
+  1335→            with state.runtime_lock:
+  1336→                if not state.is_running and steer_text:
+  1337→                    if state.interrupted_prompt_text:
+  1338→                        interrupted_prompt = state.interrupted_prompt_text
+  1339→                        state.interrupted_prompt_text = ""
+  1340→                    else:
+  1341→                        rewrite_idle = True
+  1342→            if interrupted_prompt:
+  1343→                user_text = (
+  1344→                    f"{interrupted_prompt}\n\n"
+  1345→                    f"User correction/guidance after interrupt: {steer_text}"
+  1346→                )
+  1347→                user_content = user_text
+  1348→            elif rewrite_idle:
+  1349→                user_text = steer_text
+  1350→                user_content = steer_text
+  1351→
+  1352→        # Intercept slash commands — handle locally without calling the LLM.
+  1353→        # Slash commands are text-only; if the client included images/resources,
+  1354→        # send the whole multimodal prompt to the agent instead of treating it as
+  1355→        # an ACP command.
+  1356→        if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
+  1357→            response_text = self._handle_slash_command(user_text, state)
+  1358→            if response_text is not None:
+  1359→                if self._conn:
+  1360→                    update = acp.update_agent_message_text(response_text)
+  1361→                    await self._conn.session_update(session_id, update)
+  1362→                    await self._send_usage_update(state)
+  1363→                return PromptResponse(stop_reason="end_turn")
+  1364→
+  1365→        # If Zed sends another regular prompt while the same ACP session is
+  1366→        # still running, queue it instead of racing two AIAgent loops against
+  1367→        # the same state.history. /steer and /queue are handled above and can
+  1368→        # land immediately.
+  1369→        with state.runtime_lock:
+  1370→            if state.is_running:
+  1371→                queued_text = user_text or "[Image attachment]"
+  1372→                state.queued_prompts.append(queued_text)
+  1373→                depth = len(state.queued_prompts)
+  1374→                if self._conn:
+  1375→                    update = acp.update_agent_message_text(
+  1376→                        f"Queued for the next turn. ({depth} queued)"
+  1377→                    )
+  1378→                    await self._conn.session_update(session_id, update)
+  1379→                return PromptResponse(stop_reason="end_turn")
+  1380→            state.is_running = True
+  1381→            state.current_prompt_text = user_text or "[Image attachment]"
+  1382→
+  1383→        logger.info("Prompt on session %s: %s", session_id, user_text[:100])
+  1384→
+  1385→        conn = self._conn
+  1386→        loop = asyncio.get_running_loop()
+  1387→
+  1388→        if state.cancel_event:
+  1389→            state.cancel_event.clear()
+  1390→
+  1391→        tool_call_ids: dict[str, Deque[str]] = defaultdict(deque)
+  1392→        tool_call_meta: dict[str, dict[str, Any]] = {}
+  1393→        previous_approval_cb = None
+  1394→        edit_approval_requester = None
+  1395→
+  1396→        streamed_message = False
+  1397→
+  1398→        if conn:
+  1399→            tool_progress_cb = make_tool_progress_cb(
+  1400→                conn,
+  1401→                session_id,
+  1402→                loop,
+  1403→                tool_call_ids,
+  1404→                tool_call_meta,
+  1405→                edit_approval_policy_getter=lambda: self._edit_approval_policy_for_state(state),
+  1406→            )
+  1407→            reasoning_cb = make_thinking_cb(conn, session_id, loop)
+  1408→            step_cb = make_step_cb(conn, session_id, loop, tool_call_ids, tool_call_meta)
+  1409→            message_cb = make_message_cb(conn, session_id, loop)
+  1410→
+  1411→            def stream_delta_cb(text: str) -> None:
+  1412→                nonlocal streamed_message
+  1413→                if text:
+  1414→                    streamed_message = True
+  1415→                message_cb(text)
+  1416→
+  1417→            approval_cb = make_approval_callback(conn.request_permission, loop, session_id)
+  1418→            try:
+  1419→                from acp_adapter.edit_approval import make_acp_edit_approval_requester
+  1420→
+  1421→                edit_approval_requester = make_acp_edit_approval_requester(
+  1422→                    conn.request_permission,
+  1423→                    loop,
+  1424→                    session_id,
+  1425→                    auto_approve_getter=lambda: self._edit_approval_policy_for_state(state),
+  1426→                )
+  1427→            except Exception:
+  1428→                logger.debug("Could not create ACP edit approval requester", exc_info=True)
+  1429→        else:
+  1430→            tool_progress_cb = None
+  1431→            reasoning_cb = None
+  1432→            step_cb = None
+  1433→            stream_delta_cb = None
+  1434→            approval_cb = None
+  1435→
+  1436→        agent = state.agent
+  1437→        agent.tool_progress_callback = tool_progress_cb
+  1438→        # ACP thought panes should not receive Hermes' local kawaii waiting/status
+  1439→        # updates. Route provider/model reasoning deltas instead; if the provider
+  1440→        # emits no reasoning, Zed should not get a fake "thinking" accordion.
+  1441→        agent.thinking_callback = None
+  1442→        agent.reasoning_callback = reasoning_cb
+  1443→        agent.step_callback = step_cb
+  1444→        agent.stream_delta_callback = stream_delta_cb
+  1445→
+  1446→        # Approval callback is per-thread (thread-local, GHSA-qg5c-hvr5-hjgr).
+  1447→        # Set it INSIDE _run_agent so the TLS write happens in the executor
+  1448→        # thread — setting it here would write to the event-loop thread's TLS,
+  1449→        # not the executor's. Also set HERMES_INTERACTIVE so approval.py
+  1450→        # takes the CLI-interactive path (which calls the registered
+  1451→        # callback via prompt_dangerous_approval) instead of the
+  1452→        # non-interactive auto-approve branch (GHSA-96vc-wcxf-jjff).
+  1453→        # ACP's conn.request_permission maps cleanly to the interactive
+  1454→        # callback shape — not the gateway-queue HERMES_EXEC_ASK path,
+  1455→        # which requires a notify_cb registered in _gateway_notify_cbs.
+  1456→        previous_approval_cb = None
+  1457→        previous_interactive = None
+  1458→        edit_approval_token = None
+  1459→        previous_session_id = None
+  1460→
+  1461→        def _run_agent() -> dict:
+  1462→            nonlocal previous_approval_cb, previous_interactive, edit_approval_token, previous_session_id
+  1463→            # Bind HERMES_SESSION_KEY for this session so per-session caches
+  1464→            # (e.g. the interactive sudo password cache in tools.terminal_tool)
+  1465→            # scope to the ACP session rather than leaking across sessions
+  1466→            # that land on the same reused executor thread. This call runs
+  1467→            # inside a contextvars.copy_context() below, so the ContextVar
+  1468→            # write is isolated from other concurrent ACP sessions.
+  1469→            try:
+  1470→                from gateway.session_context import (
+  1471→                    clear_session_vars,
+  1472→                    set_session_vars,
+  1473→                )
+  1474→                session_tokens = set_session_vars(session_key=session_id)
+  1475→            except Exception:
+  1476→                session_tokens = None
+  1477→                clear_session_vars = None  # type: ignore[assignment]
+  1478→                logger.debug("Could not set ACP session context", exc_info=True)
+  1479→            if approval_cb:
+  1480→                try:
+  1481→                    from tools import terminal_tool as _terminal_tool
+  1482→                    previous_approval_cb = _terminal_tool._get_approval_callback()
+  1483→                    _terminal_tool.set_approval_callback(approval_cb)
+  1484→                except Exception:
+  1485→                    logger.debug("Could not set ACP approval callback", exc_info=True)
+  1486→            if edit_approval_requester:
+  1487→                try:
+  1488→                    from acp_adapter.edit_approval import set_edit_approval_requester
+  1489→
+  1490→                    edit_approval_token = set_edit_approval_requester(edit_approval_requester)
+  1491→                except Exception:
+  1492→                    logger.debug("Could not set ACP edit approval requester", exc_info=True)
+  1493→            # Signal to tools.approval that we have an interactive callback
+  1494→            # and the non-interactive auto-approve path must not fire.
+  1495→            previous_interactive = os.environ.get("HERMES_INTERACTIVE")
+  1496→            os.environ["HERMES_INTERACTIVE"] = "1"
+  1497→            # Propagate the originating ACP session id to tools that want to
+  1498→            # tag side-effects with it (e.g. ``kanban_create`` stamps it on
+  1499→            # the new task so clients can render a per-session board). Save
+  1500→            # and restore around the agent call so a re-used executor thread
+  1501→            # never leaks one session's id into the next session's tools.
+  1502→            previous_session_id = os.environ.get("HERMES_SESSION_ID")
+  1503→            os.environ["HERMES_SESSION_ID"] = session_id
+  1504→            try:
+  1505→                result = agent.run_conversation(
+  1506→                    user_message=user_content,
+  1507→                    conversation_history=state.history,
+  1508→                    task_id=session_id,
+  1509→                    persist_user_message=user_text or "[Image attachment]",
+  1510→                )
+  1511→                return result
+  1512→            except Exception as e:
+  1513→                logger.exception("Agent error in session %s", session_id)
+  1514→                return {"final_response": f"Error: {e}", "messages": state.history}
+  1515→            finally:
+  1516→                # Restore HERMES_INTERACTIVE.
+  1517→                if previous_interactive is None:
+  1518→                    os.environ.pop("HERMES_INTERACTIVE", None)
+  1519→                else:
+  1520→                    os.environ["HERMES_INTERACTIVE"] = previous_interactive
+  1521→                # Restore HERMES_SESSION_ID symmetrically.
+  1522→                if previous_session_id is None:
+  1523→                    os.environ.pop("HERMES_SESSION_ID", None)
+  1524→                else:
+  1525→                    os.environ["HERMES_SESSION_ID"] = previous_session_id
+  1526→                if approval_cb:
+  1527→                    try:
+  1528→                        from tools import terminal_tool as _terminal_tool
+  1529→                        _terminal_tool.set_approval_callback(previous_approval_cb)
+  1530→                    except Exception:
+  1531→                        logger.debug("Could not restore approval callback", exc_info=True)
+  1532→                if edit_approval_token is not None:
+  1533→                    try:
+  1534→                        from acp_adapter.edit_approval import reset_edit_approval_requester
+  1535→
+  1536→                        reset_edit_approval_requester(edit_approval_token)
+  1537→                    except Exception:
+  1538→                        logger.debug("Could not restore ACP edit approval requester", exc_info=True)
+  1539→                if session_tokens is not None and clear_session_vars is not None:
+  1540→                    try:
+  1541→                        clear_session_vars(session_tokens)
+  1542→                    except Exception:
+  1543→                        logger.debug("Could not clear ACP session context", exc_info=True)
+  1544→
+  1545→        try:
+  1546→            # Snapshot the internal Hermes DB session id before the turn so we
+  1547→            # can detect a compression-driven session rotation afterwards. The
+  1548→            # ACP `session_id` stays the stable client handle; agent.session_id
+  1549→            # is the live internal head that compression may rotate.
+  1550→            pre_turn_hermes_id = getattr(state.agent, "session_id", None)
+  1551→            # Wrap the executor call in a fresh copy of the current context so
+  1552→            # concurrent ACP sessions on the shared ThreadPoolExecutor don't
+  1553→            # stomp on each other's ContextVar writes (HERMES_SESSION_KEY in
+  1554→            # particular — used by the interactive sudo password cache scope).
+  1555→            ctx = contextvars.copy_context()
+  1556→            result = await loop.run_in_executor(_executor, ctx.run, _run_agent)
+  1557→        except Exception:
+  1558→            logger.exception("Executor error for session %s", session_id)
+  1559→            with state.runtime_lock:
+  1560→                state.is_running = False
+  1561→                state.current_prompt_text = ""
+  1562→            return PromptResponse(stop_reason="end_turn")
+  1563→
+  1564→        if result.get("messages"):
+  1565→            state.history = result["messages"]
+  1566→            # Persist updated history so sessions survive process restarts.
+  1567→            self.session_manager.save_session(session_id)
+  1568→
+  1569→        # Detect a compression-driven internal session rotation. If the agent's
+  1570→        # DB head moved during the turn, emit a session_info_update carrying
+  1571→        # _meta.hermes.sessionProvenance so ACP clients can render the boundary
+  1572→        # and keep old/new ids in lineage. The ACP session_id is unchanged.
+  1573→        post_turn_hermes_id = getattr(state.agent, "session_id", None)
+  1574→        if (
+  1575→            conn
+  1576→            and post_turn_hermes_id
+  1577→            and pre_turn_hermes_id
+  1578→            and post_turn_hermes_id != pre_turn_hermes_id
+  1579→        ):
+  1580→            try:
+  1581→                await self._send_session_info_update(
+  1582→                    session_id,
+  1583→                    current_hermes_session_id=post_turn_hermes_id,
+  1584→                    previous_hermes_session_id=pre_turn_hermes_id,
+  1585→                )
+  1586→            except Exception:
+  1587→                logger.debug(
+  1588→                    "Could not emit ACP provenance update after rotation for %s",
+  1589→                    session_id,
+  1590→                    exc_info=True,
+  1591→                )
+  1592→
+  1593→        final_response = result.get("final_response", "")
+  1594→        cancelled = bool(state.cancel_event and state.cancel_event.is_set())
+  1595→        interrupted = bool(result.get("interrupted")) or cancelled
+  1596→        # Hermes' local "waiting for model response" interrupt status is metadata,
+  1597→        # not assistant prose — clients get cancellation from stop_reason instead.
+  1598→        from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+  1599→
+  1600→        suppress_interrupt_response = interrupted and final_response.startswith(
+  1601→            INTERRUPT_WAITING_FOR_MODEL_PREFIX
+  1602→        )
+  1603→        if final_response and not suppress_interrupt_response:
+  1604→            try:
+  1605→                from agent.title_generator import maybe_auto_title
+  1606→
+  1607→                def _notify_title_update(_title: str) -> None:
+  1608→                    if conn:
+  1609→                        loop.call_soon_threadsafe(
+  1610→                            asyncio.create_task,
+  1611→                            self._send_session_info_update(session_id),
+  1612→                        )
+  1613→
+  1614→                maybe_auto_title(
+  1615→                    self.session_manager._get_db(),
+  1616→                    session_id,
+  1617→                    user_text,
+  1618→                    final_response,
+  1619→                    state.history,
+  1620→                    title_callback=_notify_title_update,
+  1621→                )
+  1622→            except Exception:
+  1623→                logger.debug("Failed to auto-title ACP session %s", session_id, exc_info=True)
+  1624→        if (
+  1625→            final_response
+  1626→            and conn
+  1627→            and not suppress_interrupt_response
+  1628→            and (not streamed_message or result.get("response_transformed"))
+  1629→        ):
+  1630→            # Deliver the final response when streaming did not already send it,
+  1631→            # or when a plugin hook transformed the response after streaming
+  1632→            # finished (e.g. transform_llm_output) — otherwise the appended /
+  1633→            # rewritten text never reaches the client.
+  1634→            update = acp.update_agent_message_text(final_response)
+  1635→            await conn.session_update(session_id, update)
+  1636→
+  1637→        # Mark this turn idle before draining queued work so recursive prompt()
+  1638→        # calls can acquire the session. Queued turns are intentionally run as
+  1639→        # normal follow-up user prompts, preserving role alternation and history.
+  1640→        with state.runtime_lock:
+  1641→            state.is_running = False
+  1642→            state.current_prompt_text = ""
+  1643→
+  1644→        while True:
+  1645→            with state.runtime_lock:
+  1646→                if not state.queued_prompts:
+  1647→                    break
+  1648→                next_prompt = state.queued_prompts.pop(0)
+  1649→            if conn:
+  1650→                await conn.session_update(
+  1651→                    session_id,
+  1652→                    acp.update_user_message_text(next_prompt),
+  1653→                )
+  1654→            await self.prompt(
+  1655→                prompt=[TextContentBlock(type="text", text=next_prompt)],
+  1656→                session_id=session_id,
+  1657→            )
+  1658→
+  1659→        usage = None
+  1660→        if any(result.get(key) is not None for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
+  1661→            usage = Usage(
+  1662→                input_tokens=result.get("prompt_tokens", 0),
+  1663→                output_tokens=result.get("completion_tokens", 0),
+  1664→                total_tokens=result.get("total_tokens", 0),
+  1665→                thought_tokens=result.get("reasoning_tokens"),
+  1666→                cached_read_tokens=result.get("cache_read_tokens"),
+  1667→            )
+  1668→
+  1669→        await self._send_usage_update(state)
+  1670→
+  1671→        stop_reason = "cancelled" if cancelled else "end_turn"
+  1672→        return PromptResponse(stop_reason=stop_reason, usage=usage)
+  1673→
+  1674→    # ---- Slash commands (headless) -------------------------------------------
+  1675→
+  1676→    @classmethod
+  1677→    def _available_commands(cls) -> list[AvailableCommand]:
+  1678→        commands: list[AvailableCommand] = []
+  1679→        for spec in cls._ADVERTISED_COMMANDS:
+  1680→            input_hint = spec.get("input_hint")
+  1681→            commands.append(
+  1682→                AvailableCommand(
+  1683→                    name=spec["name"],
+  1684→                    description=spec["description"],
+  1685→                    input=UnstructuredCommandInput(hint=input_hint)
+  1686→                    if input_hint
+  1687→                    else None,
+  1688→                )
+  1689→            )
+  1690→        return commands
+  1691→
+  1692→    async def _send_available_commands_update(self, session_id: str) -> None:
+  1693→        """Advertise supported slash commands to the connected ACP client."""
+  1694→        if not self._conn:
+  1695→            return
+  1696→
+  1697→        try:
+  1698→            await self._conn.session_update(
+  1699→                session_id=session_id,
+  1700→                update=AvailableCommandsUpdate(
+  1701→                    session_update="available_commands_update",
+  1702→                    available_commands=self._available_commands(),
+  1703→                ),
+  1704→            )
+  1705→        except Exception:
+  1706→            logger.warning(
+  1707→                "Failed to advertise ACP slash commands for session %s",
+  1708→                session_id,
+  1709→                exc_info=True,
+  1710→            )
+  1711→
+  1712→    def _schedule_available_commands_update(self, session_id: str) -> None:
+  1713→        """Send the command advertisement after the session response is queued."""
+  1714→        if not self._conn:
+  1715→            return
+  1716→        loop = asyncio.get_running_loop()
+  1717→        loop.call_soon(
+  1718→            asyncio.create_task, self._send_available_commands_update(session_id)
+  1719→        )
+  1720→
+  1721→    def _handle_slash_command(self, text: str, state: SessionState) -> str | None:
+  1722→        """Dispatch a slash command and return the response text.
+  1723→
+  1724→        Returns ``None`` for unrecognized commands so they fall through
+  1725→        to the LLM (the user may have typed ``/something`` as prose).
+  1726→        """
+  1727→        parts = text.split(maxsplit=1)
+  1728→        cmd = parts[0].lstrip("/").lower()
+  1729→        args = parts[1].strip() if len(parts) > 1 else ""
+  1730→
+  1731→        handler = {
+  1732→            "help": self._cmd_help,
+  1733→            "model": self._cmd_model,
+  1734→            "tools": self._cmd_tools,
+  1735→            "context": self._cmd_context,
+  1736→            "reset": self._cmd_reset,
+  1737→            "compact": self._cmd_compact,
+  1738→            "steer": self._cmd_steer,
+  1739→            "queue": self._cmd_queue,
+  1740→            "version": self._cmd_version,
+  1741→        }.get(cmd)
+  1742→
+  1743→        if handler is None:
+  1744→            return None  # not a known command — let the LLM handle it
+  1745→
+  1746→        try:
+  1747→            return handler(args, state)
+  1748→        except Exception as e:
+  1749→            logger.error("Slash command /%s error: %s", cmd, e, exc_info=True)
+  1750→            return f"Error executing /{cmd}: {e}"
+  1751→
+  1752→    def _cmd_help(self, args: str, state: SessionState) -> str:
+  1753→        lines = ["Available commands:", ""]
+  1754→        for cmd, desc in self._SLASH_COMMANDS.items():
+  1755→            lines.append(f"  /{cmd:10s}  {desc}")
+  1756→        lines.append("")
+  1757→        lines.append("Unrecognized /commands are sent to the model as normal messages.")
+  1758→        return "\n".join(lines)
+  1759→
+  1760→    def _cmd_model(self, args: str, state: SessionState) -> str:
+  1761→        if not args:
+  1762→            model = state.model or getattr(state.agent, "model", "unknown")
+  1763→            provider = getattr(state.agent, "provider", None) or "auto"
+  1764→            return f"Current model: {model}\nProvider: {provider}"
+  1765→
+  1766→        current_provider = getattr(state.agent, "provider", None) or "openrouter"
+  1767→        target_provider, new_model = self._resolve_model_selection(args, current_provider)
+  1768→
+  1769→        state.model = new_model
+  1770→        state.agent = self.session_manager._make_agent(
+  1771→            session_id=state.session_id,
+  1772→            cwd=state.cwd,
+  1773→            model=new_model,
+  1774→            requested_provider=target_provider,
+  1775→        )
+  1776→        self.session_manager.save_session(state.session_id)
+  1777→        provider_label = getattr(state.agent, "provider", None) or target_provider or current_provider
+  1778→        logger.info("Session %s: model switched to %s", state.session_id, new_model)
+  1779→        return f"Model switched to: {new_model}\nProvider: {provider_label}"
+  1780→
+  1781→    def _cmd_tools(self, args: str, state: SessionState) -> str:
+  1782→        try:
+  1783→            from model_tools import get_tool_definitions
+  1784→            from types import SimpleNamespace
+  1785→            from agent.memory_manager import inject_memory_provider_tools
+  1786→
+  1787→            toolsets = _expand_acp_enabled_toolsets(
+  1788→                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
+  1789→            )
+  1790→            tools = get_tool_definitions(enabled_toolsets=toolsets, quiet_mode=True)
+  1791→            tool_view = SimpleNamespace(
+  1792→                tools=list(tools or []),
+  1793→                valid_tool_names={
+  1794→                    tool.get("function", {}).get("name")
+  1795→                    for tool in tools or []
+  1796→                    if isinstance(tool, dict)
+  1797→                },
+  1798→                enabled_toolsets=toolsets,
+  1799→                _memory_manager=getattr(state.agent, "_memory_manager", None),
+  1800→            )
+  1801→            inject_memory_provider_tools(tool_view)
+  1802→            tools = tool_view.tools
+  1803→            if not tools:
+  1804→                return "No tools available."
+  1805→            lines = [f"Available tools ({len(tools)}):"]
+  1806→            for t in tools:
+  1807→                name = t.get("function", {}).get("name", "?")
+  1808→                desc = t.get("function", {}).get("description", "")
+  1809→                # Truncate long descriptions
+  1810→                if len(desc) > 80:
+  1811→                    desc = desc[:77] + "..."
+  1812→                lines.append(f"  {name}: {desc}")
+  1813→            return "\n".join(lines)
+  1814→        except Exception as e:
+  1815→            return f"Could not list tools: {e}"
+  1816→
+  1817→    def _cmd_context(self, args: str, state: SessionState) -> str:
+  1818→        """Show ACP session context pressure and compression guidance."""
+  1819→        n_messages = len(state.history)
+  1820→
+  1821→        # Count by role.
+  1822→        roles: dict[str, int] = {}
+  1823→        for msg in state.history:
+  1824→            role = msg.get("role", "unknown")
+  1825→            roles[role] = roles.get(role, 0) + 1
+  1826→
+  1827→        agent = state.agent
+  1828→        model = state.model or getattr(agent, "model", "")
+  1829→        provider = getattr(agent, "provider", None) or "auto"
+  1830→        compressor = getattr(agent, "context_compressor", None)
+  1831→        context_length = int(getattr(compressor, "context_length", 0) or 0)
+  1832→        threshold_tokens = int(getattr(compressor, "threshold_tokens", 0) or 0)
+  1833→
+  1834→        try:
+  1835→            from agent.model_metadata import estimate_request_tokens_rough
+  1836→
+  1837→            system_prompt = getattr(agent, "_cached_system_prompt", "") or ""
+  1838→            tools = getattr(agent, "tools", None) or None
+  1839→            approx_tokens = estimate_request_tokens_rough(
+  1840→                state.history,
+  1841→                system_prompt=system_prompt,
+  1842→                tools=tools,
+  1843→            )
+  1844→        except Exception:
+  1845→            logger.debug("Could not estimate ACP context usage", exc_info=True)
+  1846→            approx_tokens = 0
+  1847→
+  1848→        if threshold_tokens <= 0 and context_length > 0:
+  1849→            threshold_tokens = int(context_length * 0.80)
+  1850→
+  1851→        lines = [
+  1852→            f"Conversation: {n_messages} messages"
+  1853→            if n_messages
+  1854→            else "Conversation is empty (no messages yet).",
+  1855→            f"  user: {roles.get('user', 0)}, assistant: {roles.get('assistant', 0)}, "
+  1856→            f"tool: {roles.get('tool', 0)}, system: {roles.get('system', 0)}",
+  1857→        ]
+  1858→        if model:
+  1859→            lines.append(f"Model: {model}")
+  1860→        lines.append(f"Provider: {provider}")
+  1861→
+  1862→        if approx_tokens > 0:
+  1863→            if context_length > 0:
+  1864→                usage_pct = (approx_tokens / context_length) * 100
+  1865→                lines.append(
+  1866→                    f"Context usage: ~{approx_tokens:,} / {context_length:,} tokens ({usage_pct:.1f}%)"
+  1867→                )
+  1868→            else:
+  1869→                lines.append(f"Context usage: ~{approx_tokens:,} tokens")
+  1870→
+  1871→        if threshold_tokens > 0:
+  1872→            if approx_tokens > 0:
+  1873→                threshold_pct = (threshold_tokens / context_length) * 100 if context_length > 0 else 0
+  1874→                remaining = max(threshold_tokens - approx_tokens, 0)
+  1875→                if approx_tokens >= threshold_tokens:
+  1876→                    lines.append(
+  1877→                        f"Compression: due now (threshold ~{threshold_tokens:,}"
+  1878→                        + (f", {threshold_pct:.0f}%" if threshold_pct else "")
+  1879→                        + "). Run /compact."
+  1880→                    )
+  1881→                else:
+  1882→                    lines.append(
+  1883→                        f"Compression: ~{remaining:,} tokens until threshold "
+  1884→                        f"(~{threshold_tokens:,}"
+  1885→                        + (f", {threshold_pct:.0f}%" if threshold_pct else "")
+  1886→                        + ")."
+  1887→                    )
+  1888→            else:
+  1889→                lines.append(f"Compression threshold: ~{threshold_tokens:,} tokens")
+  1890→
+  1891→        if getattr(agent, "compression_enabled", True) is False:
+  1892→            lines.append("Compression is disabled for this agent.")
+  1893→        else:
+  1894→            lines.append("Tip: run /compact to compress manually before the threshold.")
+  1895→
+  1896→        return "\n".join(lines)
+  1897→
+  1898→    def _cmd_reset(self, args: str, state: SessionState) -> str:
+  1899→        state.history.clear()
+  1900→        self.session_manager.save_session(state.session_id)
+  1901→        return "Conversation history cleared."
+  1902→
+  1903→    def _cmd_compact(self, args: str, state: SessionState) -> str:
+  1904→        if not state.history:
+  1905→            return "Nothing to compress — conversation is empty."
+  1906→        try:
+  1907→            agent = state.agent
+  1908→            if not getattr(agent, "compression_enabled", True):
+  1909→                return "Context compression is disabled for this agent."
+  1910→            if not hasattr(agent, "_compress_context"):
+  1911→                return "Context compression not available for this agent."
+  1912→
+  1913→            from agent.model_metadata import estimate_request_tokens_rough
+  1914→
+  1915→            original_count = len(state.history)
+  1916→            # Include system prompt + tool schemas so the figure reflects real
+  1917→            # request pressure, not a transcript-only underestimate (#6217).
+  1918→            _sys_prompt = getattr(agent, "_cached_system_prompt", "") or ""
+  1919→            _tools = getattr(agent, "tools", None) or None
+  1920→            approx_tokens = estimate_request_tokens_rough(
+  1921→                state.history, system_prompt=_sys_prompt, tools=_tools
+  1922→            )
+  1923→            original_session_db = getattr(agent, "_session_db", None)
+  1924→
+  1925→            try:
+  1926→                # ACP sessions must keep a stable session id, so avoid the
+  1927→                # SQLite session-splitting side effect inside _compress_context.
+  1928→                agent._session_db = None
+  1929→                compressed, _ = agent._compress_context(
+  1930→                    state.history,
+  1931→                    getattr(agent, "_cached_system_prompt", "") or "",
+  1932→                    approx_tokens=approx_tokens,
+  1933→                    task_id=state.session_id,
+  1934→                )
+  1935→            finally:
+  1936→                agent._session_db = original_session_db
+  1937→
+  1938→            state.history = compressed
+  1939→            self.session_manager.save_session(state.session_id)
+  1940→
+  1941→            new_count = len(state.history)
+  1942→            _sys_prompt_after = getattr(agent, "_cached_system_prompt", "") or _sys_prompt
+  1943→            _tools_after = getattr(agent, "tools", None) or _tools
+  1944→            new_tokens = estimate_request_tokens_rough(
+  1945→                state.history,
+  1946→                system_prompt=_sys_prompt_after,
+  1947→                tools=_tools_after,
+  1948→            )
+  1949→            return (
+  1950→                f"Context compressed: {original_count} -> {new_count} messages\n"
+  1951→                f"~{approx_tokens:,} -> ~{new_tokens:,} tokens"
+  1952→            )
+  1953→        except Exception as e:
+  1954→            return f"Compression failed: {e}"
+  1955→
+  1956→    def _cmd_steer(self, args: str, state: SessionState) -> str:
+  1957→        steer_text = args.strip()
+  1958→        if not steer_text:
+  1959→            return "Usage: /steer <guidance>"
+  1960→
+  1961→        if state.is_running and hasattr(state.agent, "steer"):
+  1962→            try:
+  1963→                if state.agent.steer(steer_text):
+  1964→                    preview = steer_text[:80] + ("..." if len(steer_text) > 80 else "")
+  1965→                    return f"⏩ Steer queued for the active turn: {preview}"
+  1966→            except Exception as exc:
+  1967→                logger.warning("ACP steer failed for session %s: %s", state.session_id, exc)
+  1968→                return f"⚠️ Steer failed: {exc}"
+  1969→
+  1970→        with state.runtime_lock:
+  1971→            state.queued_prompts.append(steer_text)
+  1972→            depth = len(state.queued_prompts)
+  1973→        return f"No active turn — queued for the next turn. ({depth} queued)"
+  1974→
+  1975→    def _cmd_queue(self, args: str, state: SessionState) -> str:
+  1976→        queued_text = args.strip()
+  1977→        if not queued_text:
+  1978→            return "Usage: /queue <prompt>"
+  1979→        with state.runtime_lock:
+  1980→            state.queued_prompts.append(queued_text)
+  1981→            depth = len(state.queued_prompts)
+  1982→        return f"Queued for the next turn. ({depth} queued)"
+  1983→
+  1984→    def _cmd_version(self, args: str, state: SessionState) -> str:
+  1985→        return f"Hermes Agent v{HERMES_VERSION}"
+  1986→
+  1987→    # ---- Model switching (ACP protocol method) -------------------------------
+  1988→
+  1989→    async def set_session_model(
+  1990→        self, model_id: str, session_id: str, **kwargs: Any
+  1991→    ) -> SetSessionModelResponse | None:
+  1992→        """Switch the model for a session (called by ACP protocol)."""
+  1993→        state = self.session_manager.get_session(session_id)
+  1994→        if state:
+  1995→            current_provider = getattr(state.agent, "provider", None)
+  1996→            requested_provider, resolved_model = self._resolve_model_selection(
+  1997→                model_id,
+  1998→                current_provider or "openrouter",
+  1999→            )
+  2000→            state.model = resolved_model
+
+[showing lines 1-2000 of 2060; use offset=2001 with limit to continue reading]

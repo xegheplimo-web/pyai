@@ -1,0 +1,2002 @@
+     1→"""
+     2→OpenAI-compatible API server platform adapter.
+     3→
+     4→Exposes an HTTP server with endpoints:
+     5→- POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header; opt-in long-term memory scoping via X-Hermes-Session-Key header)
+     6→- POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; X-Hermes-Session-Key supported)
+     7→- GET  /v1/responses/{response_id} — Retrieve a stored response
+     8→- DELETE /v1/responses/{response_id} — Delete a stored response
+     9→- GET  /v1/models                  — lists hermes-agent as an available model
+    10→- GET  /v1/capabilities            — machine-readable API capabilities for external UIs
+    11→- GET  /api/sessions               — list client-visible Hermes sessions
+    12→- POST /api/sessions               — create an empty Hermes session
+    13→- GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
+    14→- GET  /api/sessions/{session_id}/messages — read session message history
+    15→- POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
+    16→- POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
+    17→- POST /v1/runs                    — start a run, returns run_id immediately (202)
+    18→- GET  /v1/runs/{run_id}           — retrieve current run status
+    19→- GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
+    20→- POST /v1/runs/{run_id}/approval — resolve a pending run approval
+    21→- POST /v1/runs/{run_id}/stop       — interrupt a running agent
+    22→- GET  /health                     — health check
+    23→- GET  /health/detailed            — rich status for cross-container dashboard probing
+    24→
+    25→Any OpenAI-compatible frontend (Open WebUI, LobeChat, LibreChat,
+    26→AnythingLLM, NextChat, ChatBox, etc.) can connect to hermes-agent
+    27→through this adapter by pointing at http://localhost:8642/v1 and
+    28→authenticating with API_SERVER_KEY.
+    29→
+    30→Requires:
+    31→- aiohttp (already available in the gateway)
+    32→"""
+    33→
+    34→import asyncio
+    35→import hashlib
+    36→import hmac
+    37→import json
+    38→import logging
+    39→import os
+    40→import socket as _socket
+    41→import re
+    42→import sqlite3
+    43→import time
+    44→import uuid
+    45→from pathlib import Path
+    46→from typing import Any, Dict, List, Optional
+    47→
+    48→try:
+    49→    from aiohttp import web
+    50→    AIOHTTP_AVAILABLE = True
+    51→except ImportError:
+    52→    AIOHTTP_AVAILABLE = False
+    53→    web = None  # type: ignore[assignment]
+    54→
+    55→from gateway.config import Platform, PlatformConfig
+    56→from gateway.platforms.base import (
+    57→    BasePlatformAdapter,
+    58→    SendResult,
+    59→    is_network_accessible,
+    60→)
+    61→
+    62→logger = logging.getLogger(__name__)
+    63→
+    64→
+    65→def _hermes_version() -> str:
+    66→    """Return the hermes-agent version string, or "dev" if it can't be resolved.
+    67→
+    68→    Tries the installed package metadata first (authoritative for a pip/uv
+    69→    install), then the in-tree ``hermes_cli.__version__`` (covers editable /
+    70→    source checkouts where metadata may be stale or absent). Never raises —
+    71→    a version probe must not be able to break the health endpoint.
+    72→    """
+    73→    try:
+    74→        from importlib.metadata import version
+    75→
+    76→        return version("hermes-agent")
+    77→    except Exception:
+    78→        pass
+    79→    try:
+    80→        from hermes_cli import __version__
+    81→
+    82→        return __version__
+    83→    except Exception:
+    84→        return "dev"
+    85→
+    86→
+    87→# Default settings
+    88→DEFAULT_HOST = "127.0.0.1"
+    89→DEFAULT_PORT = 8642
+    90→MAX_STORED_RESPONSES = 100
+    91→MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
+    92→CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
+    93→MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
+    94→MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+    95→
+    96→
+    97→def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
+    98→    """Parse a listen port without letting malformed env/config values crash startup."""
+    99→    try:
+   100→        return int(value)
+   101→    except (TypeError, ValueError):
+   102→        return default
+   103→
+   104→
+   105→_TRUE_REQUEST_BOOL_STRINGS = frozenset({"1", "true", "yes", "on"})
+   106→_FALSE_REQUEST_BOOL_STRINGS = frozenset({"0", "false", "no", "off"})
+   107→
+   108→
+   109→def _coerce_request_bool(value: Any, default: bool = False) -> bool:
+   110→    """Normalize boolean-like API payload values.
+   111→
+   112→    External clients should send real JSON booleans, but some OpenAI-compatible
+   113→    frontends and middleware serialize flags like ``stream`` as strings.  Using
+   114→    Python truthiness on those values misroutes requests because ``"false"`` is
+   115→    still truthy.  Treat only explicit bool-ish scalars as booleans; everything
+   116→    else falls back to the caller's default.
+   117→    """
+   118→    if isinstance(value, bool):
+   119→        return value
+   120→    if value is None:
+   121→        return default
+   122→    if isinstance(value, str):
+   123→        normalized = value.strip().lower()
+   124→        if normalized in _TRUE_REQUEST_BOOL_STRINGS:
+   125→            return True
+   126→        if normalized in _FALSE_REQUEST_BOOL_STRINGS:
+   127→            return False
+   128→        return default
+   129→    if isinstance(value, (int, float)):
+   130→        return bool(value)
+   131→    return default
+   132→
+   133→
+   134→def _normalize_chat_content(
+   135→    content: Any, *, _max_depth: int = 10, _depth: int = 0,
+   136→) -> str:
+   137→    """Normalize OpenAI chat message content into a plain text string.
+   138→
+   139→    Some clients (Open WebUI, LobeChat, etc.) send content as an array of
+   140→    typed parts instead of a plain string::
+   141→
+   142→        [{"type": "text", "text": "hello"}, {"type": "input_text", "text": "..."}]
+   143→
+   144→    This function flattens those into a single string so the agent pipeline
+   145→    (which expects strings) doesn't choke.
+   146→
+   147→    Defensive limits prevent abuse: recursion depth, list size, and output
+   148→    length are all bounded.
+   149→    """
+   150→    if _depth > _max_depth:
+   151→        return ""
+   152→    if content is None:
+   153→        return ""
+   154→    if isinstance(content, str):
+   155→        return content[:MAX_NORMALIZED_TEXT_LENGTH] if len(content) > MAX_NORMALIZED_TEXT_LENGTH else content
+   156→
+   157→    if isinstance(content, list):
+   158→        parts: List[str] = []
+   159→        total_len = 0
+   160→        items = content[:MAX_CONTENT_LIST_SIZE] if len(content) > MAX_CONTENT_LIST_SIZE else content
+   161→        for item in items:
+   162→            if isinstance(item, str):
+   163→                if item:
+   164→                    part = item[:MAX_NORMALIZED_TEXT_LENGTH]
+   165→                    parts.append(part)
+   166→                    total_len += len(part)
+   167→            elif isinstance(item, dict):
+   168→                item_type = str(item.get("type") or "").strip().lower()
+   169→                if item_type in {"text", "input_text", "output_text"}:
+   170→                    text = item.get("text", "")
+   171→                    if text:
+   172→                        try:
+   173→                            part = str(text)[:MAX_NORMALIZED_TEXT_LENGTH]
+   174→                            parts.append(part)
+   175→                            total_len += len(part)
+   176→                        except Exception:
+   177→                            pass
+   178→                # Silently skip image_url / other non-text parts
+   179→            elif isinstance(item, list):
+   180→                nested = _normalize_chat_content(item, _max_depth=_max_depth, _depth=_depth + 1)
+   181→                if nested:
+   182→                    parts.append(nested)
+   183→                    total_len += len(nested)
+   184→            # Check accumulated size
+   185→            if total_len >= MAX_NORMALIZED_TEXT_LENGTH:
+   186→                break
+   187→        result = "\n".join(parts)
+   188→        return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
+   189→
+   190→    # Fallback for unexpected types (int, float, bool, etc.)
+   191→    try:
+   192→        result = str(content)
+   193→        return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
+   194→    except Exception:
+   195→        return ""
+   196→
+   197→
+   198→# Content part type aliases used by the OpenAI Chat Completions and Responses
+   199→# APIs.  We accept both spellings on input and emit a single canonical internal
+   200→# shape (``{"type": "text", ...}`` / ``{"type": "image_url", ...}``) that the
+   201→# rest of the agent pipeline already understands.
+   202→_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
+   203→_IMAGE_PART_TYPES = frozenset({"image_url", "input_image"})
+   204→_FILE_PART_TYPES = frozenset({"file", "input_file"})
+   205→
+   206→
+   207→def _normalize_multimodal_content(content: Any) -> Any:
+   208→    """Validate and normalize multimodal content for the API server.
+   209→
+   210→    Returns a plain string when the content is text-only, or a list of
+   211→    ``{"type": "text"|"image_url", ...}`` parts when images are present.
+   212→    The output shape is the native OpenAI Chat Completions vision format,
+   213→    which the agent pipeline accepts verbatim (OpenAI-wire providers) or
+   214→    converts (``_preprocess_anthropic_content`` for Anthropic).
+   215→
+   216→    Raises ``ValueError`` with an OpenAI-style code on invalid input:
+   217→      * ``unsupported_content_type`` — file/input_file/file_id parts, or
+   218→        non-image ``data:`` URLs.
+   219→      * ``invalid_image_url`` — missing URL or unsupported scheme.
+   220→      * ``invalid_content_part`` — malformed text/image objects.
+   221→
+   222→    Callers translate the ValueError into a 400 response.
+   223→    """
+   224→    # Scalar passthrough mirrors ``_normalize_chat_content``.
+   225→    if content is None:
+   226→        return ""
+   227→    if isinstance(content, str):
+   228→        return content[:MAX_NORMALIZED_TEXT_LENGTH] if len(content) > MAX_NORMALIZED_TEXT_LENGTH else content
+   229→    if not isinstance(content, list):
+   230→        # Mirror the legacy text-normalizer's fallback so callers that
+   231→        # pre-existed image support still get a string back.
+   232→        return _normalize_chat_content(content)
+   233→
+   234→    items = content[:MAX_CONTENT_LIST_SIZE] if len(content) > MAX_CONTENT_LIST_SIZE else content
+   235→    normalized_parts: List[Dict[str, Any]] = []
+   236→    text_accum_len = 0
+   237→
+   238→    for part in items:
+   239→        if isinstance(part, str):
+   240→            if part:
+   241→                trimmed = part[:MAX_NORMALIZED_TEXT_LENGTH]
+   242→                normalized_parts.append({"type": "text", "text": trimmed})
+   243→                text_accum_len += len(trimmed)
+   244→            continue
+   245→
+   246→        if not isinstance(part, dict):
+   247→            # Ignore unknown scalars for forward compatibility with future
+   248→            # Responses API additions (e.g. ``refusal``).  The same policy
+   249→            # the text normalizer applies.
+   250→            continue
+   251→
+   252→        raw_type = part.get("type")
+   253→        part_type = str(raw_type or "").strip().lower()
+   254→
+   255→        if part_type in _TEXT_PART_TYPES:
+   256→            text = part.get("text")
+   257→            if text is None:
+   258→                continue
+   259→            if not isinstance(text, str):
+   260→                text = str(text)
+   261→            if text:
+   262→                trimmed = text[:MAX_NORMALIZED_TEXT_LENGTH]
+   263→                normalized_parts.append({"type": "text", "text": trimmed})
+   264→                text_accum_len += len(trimmed)
+   265→            continue
+   266→
+   267→        if part_type in _IMAGE_PART_TYPES:
+   268→            detail = part.get("detail")
+   269→            image_ref = part.get("image_url")
+   270→            # OpenAI Responses sends ``input_image`` with a top-level
+   271→            # ``image_url`` string; Chat Completions sends ``image_url`` as
+   272→            # ``{"url": "...", "detail": "..."}``.  Support both.
+   273→            if isinstance(image_ref, dict):
+   274→                url_value = image_ref.get("url")
+   275→                detail = image_ref.get("detail", detail)
+   276→            else:
+   277→                url_value = image_ref
+   278→            if not isinstance(url_value, str) or not url_value.strip():
+   279→                raise ValueError("invalid_image_url:Image parts must include a non-empty image URL.")
+   280→            url_value = url_value.strip()
+   281→            lowered = url_value.lower()
+   282→            if lowered.startswith("data:"):
+   283→                if not lowered.startswith("data:image/") or "," not in url_value:
+   284→                    raise ValueError(
+   285→                        "unsupported_content_type:Only image data URLs are supported. "
+   286→                        "Non-image data payloads are not supported."
+   287→                    )
+   288→            elif not (lowered.startswith("http://") or lowered.startswith("https://")):
+   289→                raise ValueError(
+   290→                    "invalid_image_url:Image inputs must use http(s) URLs or data:image/... URLs."
+   291→                )
+   292→            image_part: Dict[str, Any] = {"type": "image_url", "image_url": {"url": url_value}}
+   293→            if detail is not None:
+   294→                if not isinstance(detail, str) or not detail.strip():
+   295→                    raise ValueError("invalid_content_part:Image detail must be a non-empty string when provided.")
+   296→                image_part["image_url"]["detail"] = detail.strip()
+   297→            normalized_parts.append(image_part)
+   298→            continue
+   299→
+   300→        if part_type in _FILE_PART_TYPES:
+   301→            raise ValueError(
+   302→                "unsupported_content_type:Inline image inputs are supported, "
+   303→                "but uploaded files and document inputs are not supported on this endpoint."
+   304→            )
+   305→
+   306→        # Unknown part type — reject explicitly so clients get a clear error
+   307→        # instead of a silently dropped turn.
+   308→        raise ValueError(
+   309→            f"unsupported_content_type:Unsupported content part type {raw_type!r}. "
+   310→            "Only text and image_url/input_image parts are supported."
+   311→        )
+   312→
+   313→    if not normalized_parts:
+   314→        return ""
+   315→
+   316→    # Text-only: collapse to a plain string so downstream logging/trajectory
+   317→    # code sees the native shape and prompt caching on text-only turns is
+   318→    # unaffected.
+   319→    if all(p.get("type") == "text" for p in normalized_parts):
+   320→        return "\n".join(p["text"] for p in normalized_parts if p.get("text"))
+   321→
+   322→    return normalized_parts
+   323→
+   324→
+   325→def _content_has_visible_payload(content: Any) -> bool:
+   326→    """True when content has any text or image attachment.  Used to reject empty turns."""
+   327→    if isinstance(content, str):
+   328→        return bool(content.strip())
+   329→    if isinstance(content, list):
+   330→        for part in content:
+   331→            if isinstance(part, dict):
+   332→                ptype = str(part.get("type") or "").strip().lower()
+   333→                if ptype in _TEXT_PART_TYPES and str(part.get("text") or "").strip():
+   334→                    return True
+   335→                if ptype in _IMAGE_PART_TYPES:
+   336→                    return True
+   337→    return False
+   338→
+   339→
+   340→def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Response":
+   341→    """Translate a ``_normalize_multimodal_content`` ValueError into a 400 response."""
+   342→    raw = str(exc)
+   343→    code, _, message = raw.partition(":")
+   344→    if not message:
+   345→        code, message = "invalid_content_part", raw
+   346→    return web.json_response(
+   347→        _openai_error(message, code=code, param=param),
+   348→        status=400,
+   349→    )
+   350→
+   351→
+   352→def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") -> tuple[Any, Optional["web.Response"]]:
+   353→    """Parse and normalize session chat ``message`` / ``input`` like chat completions."""
+   354→    user_message = body.get("message") or body.get("input")
+   355→    if not _content_has_visible_payload(user_message):
+   356→        return None, web.json_response(
+   357→            _openai_error("Missing 'message' field", code="missing_message"),
+   358→            status=400,
+   359→        )
+   360→    try:
+   361→        return _normalize_multimodal_content(user_message), None
+   362→    except ValueError as exc:
+   363→        return None, _multimodal_validation_error(exc, param=param)
+   364→
+   365→
+   366→def check_api_server_requirements() -> bool:
+   367→    """Check if API server dependencies are available."""
+   368→    return AIOHTTP_AVAILABLE
+   369→
+   370→
+   371→class ResponseStore:
+   372→    """
+   373→    SQLite-backed LRU store for Responses API state.
+   374→
+   375→    Each stored response includes the full internal conversation history
+   376→    (with tool calls and results) so it can be reconstructed on subsequent
+   377→    requests via previous_response_id.
+   378→
+   379→    Persists across gateway restarts.  Falls back to in-memory SQLite
+   380→    if the on-disk path is unavailable.
+   381→    """
+   382→
+   383→    def __init__(self, max_size: int = MAX_STORED_RESPONSES, db_path: str = None):
+   384→        self._max_size = max_size
+   385→        if db_path is None:
+   386→            try:
+   387→                from hermes_cli.config import get_hermes_home
+   388→                db_path = str(get_hermes_home() / "response_store.db")
+   389→            except Exception:
+   390→                db_path = ":memory:"
+   391→        self._db_path: Optional[str] = db_path if db_path != ":memory:" else None
+   392→        try:
+   393→            self._conn = sqlite3.connect(db_path, check_same_thread=False)
+   394→        except Exception:
+   395→            self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+   396→            self._db_path = None
+   397→        # Use shared WAL-fallback helper so response_store.db degrades
+   398→        # gracefully on NFS/SMB/FUSE-mounted HERMES_HOME (same filesystem
+   399→        # issue addressed for state.db/kanban.db — see
+   400→        # hermes_state._WAL_INCOMPAT_MARKERS).
+   401→        from hermes_state import apply_wal_with_fallback
+   402→        apply_wal_with_fallback(self._conn, db_label="response_store.db")
+   403→        self._conn.execute(
+   404→            """CREATE TABLE IF NOT EXISTS responses (
+   405→                response_id TEXT PRIMARY KEY,
+   406→                data TEXT NOT NULL,
+   407→                accessed_at REAL NOT NULL
+   408→            )"""
+   409→        )
+   410→        self._conn.execute(
+   411→            """CREATE TABLE IF NOT EXISTS conversations (
+   412→                name TEXT PRIMARY KEY,
+   413→                response_id TEXT NOT NULL
+   414→            )"""
+   415→        )
+   416→        self._conn.commit()
+   417→        # response_store.db contains conversation history (tool payloads,
+   418→        # prompts, results). Tighten to owner-only after creation so other
+   419→        # local users on a shared box can't read it. Run once at __init__
+   420→        # rather than after every commit — chmod-on-every-write is wasted
+   421→        # syscalls on a hot path.
+   422→        self._tighten_file_permissions()
+   423→
+   424→    def _tighten_file_permissions(self) -> None:
+   425→        """Force owner-only permissions on the DB and SQLite sidecars."""
+   426→        if not self._db_path:
+   427→            return
+   428→        for candidate in (
+   429→            Path(self._db_path),
+   430→            Path(f"{self._db_path}-wal"),
+   431→            Path(f"{self._db_path}-shm"),
+   432→        ):
+   433→            try:
+   434→                if candidate.exists():
+   435→                    candidate.chmod(0o600)
+   436→            except OSError:
+   437→                logger.debug(
+   438→                    "Failed to restrict response store permissions for %s",
+   439→                    candidate,
+   440→                    exc_info=True,
+   441→                )
+   442→
+   443→    def get(self, response_id: str) -> Optional[Dict[str, Any]]:
+   444→        """Retrieve a stored response by ID (updates access time for LRU)."""
+   445→        row = self._conn.execute(
+   446→            "SELECT data FROM responses WHERE response_id = ?", (response_id,)
+   447→        ).fetchone()
+   448→        if row is None:
+   449→            return None
+   450→        self._conn.execute(
+   451→            "UPDATE responses SET accessed_at = ? WHERE response_id = ?",
+   452→            (time.time(), response_id),
+   453→        )
+   454→        self._conn.commit()
+   455→        try:
+   456→            return json.loads(row[0])
+   457→        except (json.JSONDecodeError, TypeError):
+   458→            logger.warning(
+   459→                "Corrupted JSON in response store for id=%s, evicting entry",
+   460→                response_id,
+   461→            )
+   462→            self._conn.execute(
+   463→                "DELETE FROM responses WHERE response_id = ?",
+   464→                (response_id,),
+   465→            )
+   466→            self._conn.commit()
+   467→            return None
+   468→
+   469→    def put(self, response_id: str, data: Dict[str, Any]) -> None:
+   470→        """Store a response, evicting the oldest if at capacity."""
+   471→        self._conn.execute(
+   472→            "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
+   473→            (response_id, json.dumps(data, default=str), time.time()),
+   474→        )
+   475→        # Evict oldest entries beyond max_size
+   476→        count = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
+   477→        if count > self._max_size:
+   478→            # Collect IDs that will be evicted
+   479→            evict_ids = [
+   480→                row[0]
+   481→                for row in self._conn.execute(
+   482→                    "SELECT response_id FROM responses ORDER BY accessed_at ASC LIMIT ?",
+   483→                    (count - self._max_size,),
+   484→                ).fetchall()
+   485→            ]
+   486→            if evict_ids:
+   487→                placeholders = ",".join("?" for _ in evict_ids)
+   488→                # Clear conversation mappings pointing to evicted responses
+   489→                self._conn.execute(
+   490→                    f"DELETE FROM conversations WHERE response_id IN ({placeholders})",
+   491→                    evict_ids,
+   492→                )
+   493→                # Delete evicted responses
+   494→                self._conn.execute(
+   495→                    f"DELETE FROM responses WHERE response_id IN ({placeholders})",
+   496→                    evict_ids,
+   497→                )
+   498→        self._conn.commit()
+   499→
+   500→    def delete(self, response_id: str) -> bool:
+   501→        """Remove a response from the store. Returns True if found and deleted."""
+   502→        # Clear conversation mappings pointing to this response
+   503→        self._conn.execute(
+   504→            "DELETE FROM conversations WHERE response_id = ?", (response_id,)
+   505→        )
+   506→        cursor = self._conn.execute(
+   507→            "DELETE FROM responses WHERE response_id = ?", (response_id,)
+   508→        )
+   509→        self._conn.commit()
+   510→        return cursor.rowcount > 0
+   511→
+   512→    def get_conversation(self, name: str) -> Optional[str]:
+   513→        """Get the latest response_id for a conversation name."""
+   514→        row = self._conn.execute(
+   515→            "SELECT response_id FROM conversations WHERE name = ?", (name,)
+   516→        ).fetchone()
+   517→        return row[0] if row else None
+   518→
+   519→    def set_conversation(self, name: str, response_id: str) -> None:
+   520→        """Map a conversation name to its latest response_id."""
+   521→        self._conn.execute(
+   522→            "INSERT OR REPLACE INTO conversations (name, response_id) VALUES (?, ?)",
+   523→            (name, response_id),
+   524→        )
+   525→        self._conn.commit()
+   526→
+   527→    def close(self) -> None:
+   528→        """Close the database connection."""
+   529→        try:
+   530→            self._conn.close()
+   531→        except Exception:
+   532→            pass
+   533→
+   534→    def __len__(self) -> int:
+   535→        row = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()
+   536→        return row[0] if row else 0
+   537→
+   538→
+   539→# ---------------------------------------------------------------------------
+   540→# CORS middleware
+   541→# ---------------------------------------------------------------------------
+   542→
+   543→_CORS_HEADERS = {
+   544→    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+   545→    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+   546→}
+   547→
+   548→
+   549→if AIOHTTP_AVAILABLE:
+   550→    @web.middleware
+   551→    async def cors_middleware(request, handler):
+   552→        """Add CORS headers for explicitly allowed origins; handle OPTIONS preflight."""
+   553→        adapter = request.app.get("api_server_adapter")
+   554→        origin = request.headers.get("Origin", "")
+   555→        cors_headers = None
+   556→        if adapter is not None:
+   557→            if not adapter._origin_allowed(origin):
+   558→                return web.Response(status=403)
+   559→            cors_headers = adapter._cors_headers_for_origin(origin)
+   560→
+   561→        if request.method == "OPTIONS":
+   562→            if cors_headers is None:
+   563→                return web.Response(status=403)
+   564→            return web.Response(status=200, headers=cors_headers)
+   565→
+   566→        response = await handler(request)
+   567→        if cors_headers is not None:
+   568→            response.headers.update(cors_headers)
+   569→        return response
+   570→else:
+   571→    cors_middleware = None  # type: ignore[assignment]
+   572→
+   573→
+   574→def _openai_error(message: str, err_type: str = "invalid_request_error", param: str = None, code: str = None) -> Dict[str, Any]:
+   575→    """OpenAI-style error envelope."""
+   576→    return {
+   577→        "error": {
+   578→            "message": message,
+   579→            "type": err_type,
+   580→            "param": param,
+   581→            "code": code,
+   582→        }
+   583→    }
+   584→
+   585→
+   586→if AIOHTTP_AVAILABLE:
+   587→    @web.middleware
+   588→    async def body_limit_middleware(request, handler):
+   589→        """Reject overly large request bodies early based on Content-Length."""
+   590→        if request.method in {"POST", "PUT", "PATCH"}:
+   591→            cl = request.headers.get("Content-Length")
+   592→            if cl is not None:
+   593→                try:
+   594→                    if int(cl) > MAX_REQUEST_BYTES:
+   595→                        return web.json_response(_openai_error("Request body too large.", code="body_too_large"), status=413)
+   596→                except ValueError:
+   597→                    return web.json_response(_openai_error("Invalid Content-Length header.", code="invalid_content_length"), status=400)
+   598→        return await handler(request)
+   599→else:
+   600→    body_limit_middleware = None  # type: ignore[assignment]
+   601→
+   602→_SECURITY_HEADERS = {
+   603→    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
+   604→    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+   605→    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+   606→    "X-Content-Type-Options": "nosniff",
+   607→    "X-Frame-Options": "DENY",
+   608→    "X-XSS-Protection": "0",
+   609→    "Referrer-Policy": "no-referrer",
+   610→}
+   611→
+   612→
+   613→if AIOHTTP_AVAILABLE:
+   614→    @web.middleware
+   615→    async def security_headers_middleware(request, handler):
+   616→        """Add security headers to all responses (including errors)."""
+   617→        response = await handler(request)
+   618→        for k, v in _SECURITY_HEADERS.items():
+   619→            response.headers.setdefault(k, v)
+   620→        return response
+   621→else:
+   622→    security_headers_middleware = None  # type: ignore[assignment]
+   623→
+   624→
+   625→class _IdempotencyCache:
+   626→    """In-memory idempotency cache with TTL and basic LRU semantics."""
+   627→    def __init__(self, max_items: int = 1000, ttl_seconds: int = 300):
+   628→        from collections import OrderedDict
+   629→        self._store = OrderedDict()
+   630→        self._inflight: Dict[tuple[str, str], "asyncio.Task[Any]"] = {}
+   631→        self._ttl = ttl_seconds
+   632→        self._max = max_items
+   633→
+   634→    def _purge(self):
+   635→        now = time.time()
+   636→        expired = [k for k, v in self._store.items() if now - v["ts"] > self._ttl]
+   637→        for k in expired:
+   638→            self._store.pop(k, None)
+   639→        while len(self._store) > self._max:
+   640→            self._store.popitem(last=False)
+   641→
+   642→    async def get_or_set(self, key: str, fingerprint: str, compute_coro):
+   643→        self._purge()
+   644→        item = self._store.get(key)
+   645→        if item and item["fp"] == fingerprint:
+   646→            return item["resp"]
+   647→
+   648→        inflight_key = (key, fingerprint)
+   649→        task = self._inflight.get(inflight_key)
+   650→        if task is None:
+   651→            async def _compute_and_store():
+   652→                resp = await compute_coro()
+   653→                import time as _t
+   654→                self._store[key] = {"resp": resp, "fp": fingerprint, "ts": _t.time()}
+   655→                self._purge()
+   656→                return resp
+   657→
+   658→            task = asyncio.create_task(_compute_and_store())
+   659→            self._inflight[inflight_key] = task
+   660→
+   661→            def _clear_inflight(done_task: "asyncio.Task[Any]") -> None:
+   662→                if self._inflight.get(inflight_key) is done_task:
+   663→                    self._inflight.pop(inflight_key, None)
+   664→
+   665→            task.add_done_callback(_clear_inflight)
+   666→
+   667→        return await asyncio.shield(task)
+   668→
+   669→
+   670→_idem_cache = _IdempotencyCache()
+   671→
+   672→
+   673→def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
+   674→    from hashlib import sha256
+   675→    subset = {k: body.get(k) for k in keys}
+   676→    return sha256(repr(subset).encode("utf-8")).hexdigest()
+   677→
+   678→
+   679→def _derive_chat_session_id(
+   680→    system_prompt: Optional[str],
+   681→    first_user_message: str,
+   682→) -> str:
+   683→    """Derive a stable session ID from the conversation's first user message.
+   684→
+   685→    OpenAI-compatible frontends (Open WebUI, LibreChat, etc.) send the full
+   686→    conversation history with every request.  The system prompt and first user
+   687→    message are constant across all turns of the same conversation, so hashing
+   688→    them produces a deterministic session ID that lets the API server reuse
+   689→    the same Hermes session (and therefore the same Docker container sandbox
+   690→    directory) across turns.
+   691→    """
+   692→    seed = f"{system_prompt or ''}\n{first_user_message}"
+   693→    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+   694→    return f"api-{digest}"
+   695→
+   696→
+   697→_CRON_AVAILABLE = False
+   698→try:
+   699→    from cron.jobs import (
+   700→        list_jobs as _cron_list,
+   701→        get_job as _cron_get,
+   702→        create_job as _cron_create,
+   703→        update_job as _cron_update,
+   704→        remove_job as _cron_remove,
+   705→        pause_job as _cron_pause,
+   706→        resume_job as _cron_resume,
+   707→        trigger_job as _cron_trigger,
+   708→    )
+   709→    _CRON_AVAILABLE = True
+   710→except ImportError:
+   711→    _cron_list = None
+   712→    _cron_get = None
+   713→    _cron_create = None
+   714→    _cron_update = None
+   715→    _cron_remove = None
+   716→    _cron_pause = None
+   717→    _cron_resume = None
+   718→    _cron_trigger = None
+   719→
+   720→# Defense-in-depth: mirror the agent-facing cronjob tool, which scans the
+   721→# user-supplied prompt for exfiltration/injection payloads at create/update
+   722→# time (tools/cronjob_tools.py).  The REST cron endpoints are authenticated
+   723→# (every handler runs _check_auth, and connect() refuses to start without
+   724→# API_SERVER_KEY), so this is not the trust boundary — it's parity with the
+   725→# tool path so a malicious prompt is rejected the same way regardless of
+   726→# which surface created the job.  Imported defensively: a missing scanner
+   727→# must not disable the cron REST API.
+   728→try:
+   729→    from tools.cronjob_tools import _scan_cron_prompt as _scan_cron_prompt
+   730→except Exception:  # pragma: no cover - scanner is optional hardening
+   731→    _scan_cron_prompt = None
+   732→
+   733→
+   734→class APIServerAdapter(BasePlatformAdapter):
+   735→    """
+   736→    OpenAI-compatible HTTP API server adapter.
+   737→
+   738→    Runs an aiohttp web server that accepts OpenAI-format requests
+   739→    and routes them through hermes-agent's AIAgent.
+   740→    """
+   741→
+   742→    def __init__(self, config: PlatformConfig):
+   743→        super().__init__(config, Platform.API_SERVER)
+   744→        extra = config.extra or {}
+   745→        self._host: str = extra.get("host", os.getenv("API_SERVER_HOST", DEFAULT_HOST))
+   746→        raw_port = extra.get("port")
+   747→        if raw_port is None:
+   748→            raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
+   749→        self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
+   750→        self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
+   751→        self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
+   752→            extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
+   753→        )
+   754→        self._model_name: str = self._resolve_model_name(
+   755→            extra.get("model_name", os.getenv("API_SERVER_MODEL_NAME", "")),
+   756→        )
+   757→        self._app: Optional["web.Application"] = None
+   758→        self._runner: Optional["web.AppRunner"] = None
+   759→        self._site: Optional["web.TCPSite"] = None
+   760→        self._response_store = ResponseStore()
+   761→        # Active run streams: run_id -> asyncio.Queue of SSE event dicts
+   762→        self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
+   763→        # Creation timestamps for orphaned-run TTL sweep
+   764→        self._run_streams_created: Dict[str, float] = {}
+   765→        # Active run agent/task references for stop support
+   766→        self._active_run_agents: Dict[str, Any] = {}
+   767→        self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
+   768→        # Pollable run status for dashboards and external control-plane UIs.
+   769→        self._run_statuses: Dict[str, Dict[str, Any]] = {}
+   770→        # Active approval session key for each run_id.  The approval core
+   771→        # resolves requests by session key, while API clients address the
+   772→        # in-flight run by run_id.
+   773→        self._run_approval_sessions: Dict[str, str] = {}
+   774→        self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+   775→
+   776→    @staticmethod
+   777→    def _parse_cors_origins(value: Any) -> tuple[str, ...]:
+   778→        """Normalize configured CORS origins into a stable tuple."""
+   779→        if not value:
+   780→            return ()
+   781→
+   782→        if isinstance(value, str):
+   783→            items = value.split(",")
+   784→        elif isinstance(value, (list, tuple, set)):
+   785→            items = value
+   786→        else:
+   787→            items = [str(value)]
+   788→
+   789→        return tuple(str(item).strip() for item in items if str(item).strip())
+   790→
+   791→    @staticmethod
+   792→    def _resolve_model_name(explicit: str) -> str:
+   793→        """Derive the advertised model name for /v1/models.
+   794→
+   795→        Priority:
+   796→        1. Explicit override (config extra or API_SERVER_MODEL_NAME env var)
+   797→        2. Active profile name (so each profile advertises a distinct model)
+   798→        3. Fallback: "hermes-agent"
+   799→        """
+   800→        if explicit and explicit.strip():
+   801→            return explicit.strip()
+   802→        try:
+   803→            from hermes_cli.profiles import get_active_profile_name
+   804→            profile = get_active_profile_name()
+   805→            if profile and profile not in {"default", "custom"}:
+   806→                return profile
+   807→        except Exception:
+   808→            pass
+   809→        return "hermes-agent"
+   810→
+   811→    def _cors_headers_for_origin(self, origin: str) -> Optional[Dict[str, str]]:
+   812→        """Return CORS headers for an allowed browser origin."""
+   813→        if not origin or not self._cors_origins:
+   814→            return None
+   815→
+   816→        if "*" in self._cors_origins:
+   817→            headers = dict(_CORS_HEADERS)
+   818→            headers["Access-Control-Allow-Origin"] = "*"
+   819→            headers["Access-Control-Max-Age"] = "600"
+   820→            return headers
+   821→
+   822→        if origin not in self._cors_origins:
+   823→            return None
+   824→
+   825→        headers = dict(_CORS_HEADERS)
+   826→        headers["Access-Control-Allow-Origin"] = origin
+   827→        headers["Vary"] = "Origin"
+   828→        headers["Access-Control-Max-Age"] = "600"
+   829→        return headers
+   830→
+   831→    def _origin_allowed(self, origin: str) -> bool:
+   832→        """Allow non-browser clients and explicitly configured browser origins."""
+   833→        if not origin:
+   834→            return True
+   835→
+   836→        if not self._cors_origins:
+   837→            return False
+   838→
+   839→        return "*" in self._cors_origins or origin in self._cors_origins
+   840→
+   841→    @staticmethod
+   842→    def _clean_log_value(value: Any, *, max_len: int = 200) -> str:
+   843→        """Sanitize request metadata before it reaches security logs."""
+   844→        if value is None:
+   845→            return ""
+   846→        text = str(value).replace("\r", " ").replace("\n", " ").strip()
+   847→        return text[:max_len]
+   848→
+   849→    def _request_audit_context(self, request: "web.Request") -> Dict[str, str]:
+   850→        """Return non-secret source metadata for security/audit warnings."""
+   851→        peer_ip = ""
+   852→        try:
+   853→            peer = request.transport.get_extra_info("peername") if request.transport else None
+   854→            if isinstance(peer, (tuple, list)) and peer:
+   855→                peer_ip = str(peer[0])
+   856→        except Exception:
+   857→            peer_ip = ""
+   858→
+   859→        return {
+   860→            "remote": self._clean_log_value(getattr(request, "remote", "") or peer_ip),
+   861→            "peer_ip": self._clean_log_value(peer_ip),
+   862→            "forwarded_for": self._clean_log_value(request.headers.get("X-Forwarded-For", "")),
+   863→            "real_ip": self._clean_log_value(request.headers.get("X-Real-IP", "")),
+   864→            "method": self._clean_log_value(request.method, max_len=16),
+   865→            "path": self._clean_log_value(request.path_qs, max_len=500),
+   866→            "user_agent": self._clean_log_value(request.headers.get("User-Agent", ""), max_len=300),
+   867→        }
+   868→
+   869→    def _request_audit_log_suffix(self, request: "web.Request") -> str:
+   870→        ctx = self._request_audit_context(request)
+   871→        fields = [f"{key}={value!r}" for key, value in ctx.items() if value]
+   872→        return " ".join(fields) if fields else "source='unknown'"
+   873→
+   874→    def _cron_origin_from_request(self, request: "web.Request") -> Dict[str, str]:
+   875→        """Persist safe API source metadata on cron jobs created over HTTP."""
+   876→        ctx = self._request_audit_context(request)
+   877→        origin = {
+   878→            "platform": "api_server",
+   879→            "chat_id": "api",
+   880→        }
+   881→        if ctx.get("remote"):
+   882→            origin["source_ip"] = ctx["remote"]
+   883→        if ctx.get("peer_ip"):
+   884→            origin["peer_ip"] = ctx["peer_ip"]
+   885→        if ctx.get("forwarded_for"):
+   886→            origin["forwarded_for"] = ctx["forwarded_for"]
+   887→        if ctx.get("real_ip"):
+   888→            origin["real_ip"] = ctx["real_ip"]
+   889→        if ctx.get("user_agent"):
+   890→            origin["user_agent"] = ctx["user_agent"]
+   891→        return origin
+   892→
+   893→    # ------------------------------------------------------------------
+   894→    # Auth helper
+   895→    # ------------------------------------------------------------------
+   896→
+   897→    def _check_auth(self, request: "web.Request") -> Optional["web.Response"]:
+   898→        """
+   899→        Validate Bearer token from Authorization header.
+   900→
+   901→        Returns None if auth is OK, or a 401 web.Response on failure.
+   902→        connect() refuses to start the API server without API_SERVER_KEY, so
+   903→        the no-key branch only exists for tests or unsupported manual wiring.
+   904→        """
+   905→        if not self._api_key:
+   906→            return None
+   907→
+   908→        auth_header = request.headers.get("Authorization", "")
+   909→        if auth_header.startswith("Bearer "):
+   910→            token = auth_header[7:].strip()
+   911→            if hmac.compare_digest(token, self._api_key):
+   912→                return None  # Auth OK
+   913→
+   914→        logger.warning(
+   915→            "API server rejected invalid API key: %s",
+   916→            self._request_audit_log_suffix(request),
+   917→        )
+   918→        return web.json_response(
+   919→            {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
+   920→            status=401,
+   921→        )
+   922→
+   923→    # ------------------------------------------------------------------
+   924→    # Session header helpers
+   925→    # ------------------------------------------------------------------
+   926→
+   927→    # Soft length cap for session identifiers.  Headers are bounded in
+   928→    # aggregate by aiohttp (``client_max_size`` / default 8 KiB per
+   929→    # header), but we impose a tighter limit on the session headers so a
+   930→    # caller can't burn memory by passing a multi-kilobyte "session key".
+   931→    # 256 chars is well above any realistic stable channel identifier
+   932→    # (e.g. ``agent:main:webui:dm:user-42``) while staying small enough
+   933→    # that the sanitized form is safe to pass into Honcho / state.db.
+   934→    _MAX_SESSION_HEADER_LEN = 256
+   935→
+   936→    def _parse_session_key_header(
+   937→        self, request: "web.Request"
+   938→    ) -> tuple[Optional[str], Optional["web.Response"]]:
+   939→        """Extract and validate the ``X-Hermes-Session-Key`` header.
+   940→
+   941→        The session key is a stable per-channel identifier that scopes
+   942→        long-term memory (e.g. Honcho sessions) across transcripts.  It
+   943→        is independent of ``X-Hermes-Session-Id``: callers may send
+   944→        either, both, or neither.
+   945→
+   946→        Returns ``(session_key, None)`` on success (with an empty/absent
+   947→        header yielding ``None`` for the key), or ``(None, error_response)``
+   948→        on validation failure.
+   949→
+   950→        Security: like session continuation, accepting a caller-supplied
+   951→        memory scope requires API-key authentication so that an
+   952→        unauthenticated client on a local-only server can't inject itself
+   953→        into another user's long-term memory scope by guessing a key.
+   954→        """
+   955→        raw = request.headers.get("X-Hermes-Session-Key", "").strip()
+   956→        if not raw:
+   957→            return None, None
+   958→
+   959→        if not self._api_key:
+   960→            logger.warning(
+   961→                "X-Hermes-Session-Key rejected: no API key configured. "
+   962→                "Set API_SERVER_KEY to enable long-term memory scoping."
+   963→            )
+   964→            return None, web.json_response(
+   965→                _openai_error(
+   966→                    "X-Hermes-Session-Key requires API key authentication. "
+   967→                    "Configure API_SERVER_KEY to enable this feature."
+   968→                ),
+   969→                status=403,
+   970→            )
+   971→
+   972→        # Reject control characters that could enable header injection on
+   973→        # the echo path.
+   974→        if re.search(r'[\r\n\x00]', raw):
+   975→            return None, web.json_response(
+   976→                {"error": {"message": "Invalid session key", "type": "invalid_request_error"}},
+   977→                status=400,
+   978→            )
+   979→
+   980→        if len(raw) > self._MAX_SESSION_HEADER_LEN:
+   981→            return None, web.json_response(
+   982→                {"error": {"message": "Session key too long", "type": "invalid_request_error"}},
+   983→                status=400,
+   984→            )
+   985→
+   986→        return raw, None
+   987→
+   988→    # ------------------------------------------------------------------
+   989→    # Session DB helper
+   990→    # ------------------------------------------------------------------
+   991→
+   992→    def _ensure_session_db(self):
+   993→        """Lazily initialise and return the shared SessionDB instance.
+   994→
+   995→        Sessions are persisted to ``state.db`` so that ``hermes sessions list``
+   996→        shows API-server conversations alongside CLI and gateway ones.
+   997→        """
+   998→        if self._session_db is None:
+   999→            try:
+  1000→                from hermes_state import SessionDB
+  1001→                self._session_db = SessionDB()
+  1002→            except Exception as e:
+  1003→                logger.debug("SessionDB unavailable for API server: %s", e)
+  1004→        return self._session_db
+  1005→
+  1006→    # ------------------------------------------------------------------
+  1007→    # Agent creation helper
+  1008→    # ------------------------------------------------------------------
+  1009→
+  1010→    def _create_agent(
+  1011→        self,
+  1012→        ephemeral_system_prompt: Optional[str] = None,
+  1013→        session_id: Optional[str] = None,
+  1014→        stream_delta_callback=None,
+  1015→        tool_progress_callback=None,
+  1016→        tool_start_callback=None,
+  1017→        tool_complete_callback=None,
+  1018→        gateway_session_key: Optional[str] = None,
+  1019→    ) -> Any:
+  1020→        """
+  1021→        Create an AIAgent instance using the gateway's runtime config.
+  1022→
+  1023→        Uses _resolve_runtime_agent_kwargs() to pick up model, api_key,
+  1024→        base_url, etc. from config.yaml / env vars.  Toolsets are resolved
+  1025→        from config.yaml platform_toolsets.api_server (same as all other
+  1026→        gateway platforms), falling back to the hermes-api-server default.
+  1027→
+  1028→        ``gateway_session_key`` is a stable per-channel identifier supplied
+  1029→        by the client (via ``X-Hermes-Session-Key``).  Unlike ``session_id``
+  1030→        which scopes the short-term transcript and rotates on /new, this
+  1031→        key is meant to persist across transcripts so long-term memory
+  1032→        providers (e.g. Honcho) can scope their per-chat state correctly
+  1033→        — matching the semantics of the native gateway's ``session_key``.
+  1034→        """
+  1035→        from run_agent import AIAgent
+  1036→        from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config, GatewayRunner
+  1037→        from hermes_cli.tools_config import _get_platform_tools
+  1038→
+  1039→        runtime_kwargs = _resolve_runtime_agent_kwargs()
+  1040→        reasoning_config = GatewayRunner._load_reasoning_config()
+  1041→        model = _resolve_gateway_model()
+  1042→
+  1043→        user_config = _load_gateway_config()
+  1044→        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+  1045→
+  1046→        max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+  1047→
+  1048→        # Load fallback provider chain so the API server platform has the
+  1049→        # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
+  1050→        fallback_model = GatewayRunner._load_fallback_model()
+  1051→
+  1052→        agent = AIAgent(
+  1053→            model=model,
+  1054→            **runtime_kwargs,
+  1055→            max_iterations=max_iterations,
+  1056→            quiet_mode=True,
+  1057→            verbose_logging=False,
+  1058→            ephemeral_system_prompt=ephemeral_system_prompt or None,
+  1059→            enabled_toolsets=enabled_toolsets,
+  1060→            session_id=session_id,
+  1061→            platform="api_server",
+  1062→            stream_delta_callback=stream_delta_callback,
+  1063→            tool_progress_callback=tool_progress_callback,
+  1064→            tool_start_callback=tool_start_callback,
+  1065→            tool_complete_callback=tool_complete_callback,
+  1066→            session_db=self._ensure_session_db(),
+  1067→            fallback_model=fallback_model,
+  1068→            reasoning_config=reasoning_config,
+  1069→            gateway_session_key=gateway_session_key,
+  1070→        )
+  1071→        return agent
+  1072→
+  1073→    # ------------------------------------------------------------------
+  1074→    # HTTP Handlers
+  1075→    # ------------------------------------------------------------------
+  1076→
+  1077→    async def _handle_health(self, request: "web.Request") -> "web.Response":
+  1078→        """GET /health — simple health check."""
+  1079→        return web.json_response(
+  1080→            {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
+  1081→        )
+  1082→
+  1083→    async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
+  1084→        """GET /health/detailed — rich status for cross-container dashboard probing.
+  1085→
+  1086→        Returns gateway state, connected platforms, PID, and uptime so the
+  1087→        dashboard can display full status without needing a shared PID file or
+  1088→        /proc access.  No authentication required.
+  1089→        """
+  1090→        from gateway.status import read_runtime_status
+  1091→
+  1092→        runtime = read_runtime_status() or {}
+  1093→        return web.json_response({
+  1094→            "status": "ok",
+  1095→            "platform": "hermes-agent",
+  1096→            "version": _hermes_version(),
+  1097→            "gateway_state": runtime.get("gateway_state"),
+  1098→            "platforms": runtime.get("platforms", {}),
+  1099→            "active_agents": runtime.get("active_agents", 0),
+  1100→            "exit_reason": runtime.get("exit_reason"),
+  1101→            "updated_at": runtime.get("updated_at"),
+  1102→            "pid": os.getpid(),
+  1103→        })
+  1104→
+  1105→    async def _handle_models(self, request: "web.Request") -> "web.Response":
+  1106→        """GET /v1/models — return hermes-agent as an available model."""
+  1107→        auth_err = self._check_auth(request)
+  1108→        if auth_err:
+  1109→            return auth_err
+  1110→
+  1111→        return web.json_response({
+  1112→            "object": "list",
+  1113→            "data": [
+  1114→                {
+  1115→                    "id": self._model_name,
+  1116→                    "object": "model",
+  1117→                    "created": int(time.time()),
+  1118→                    "owned_by": "hermes",
+  1119→                    "permission": [],
+  1120→                    "root": self._model_name,
+  1121→                    "parent": None,
+  1122→                }
+  1123→            ],
+  1124→        })
+  1125→
+  1126→    async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
+  1127→        """GET /v1/capabilities — advertise the stable API surface.
+  1128→
+  1129→        External UIs and orchestrators use this endpoint to discover the API
+  1130→        server's plugin-safe contract without scraping docs or assuming that
+  1131→        every Hermes version exposes the same endpoints.
+  1132→        """
+  1133→        auth_err = self._check_auth(request)
+  1134→        if auth_err:
+  1135→            return auth_err
+  1136→
+  1137→        return web.json_response({
+  1138→            "object": "hermes.api_server.capabilities",
+  1139→            "platform": "hermes-agent",
+  1140→            "model": self._model_name,
+  1141→            "auth": {
+  1142→                "type": "bearer",
+  1143→                "required": bool(self._api_key),
+  1144→            },
+  1145→            "runtime": {
+  1146→                "mode": "server_agent",
+  1147→                "tool_execution": "server",
+  1148→                "split_runtime": False,
+  1149→                "description": (
+  1150→                    "The API server creates a server-side Hermes AIAgent; "
+  1151→                    "tools execute on the API-server host unless a future "
+  1152→                    "explicit split-runtime mode is enabled."
+  1153→                ),
+  1154→            },
+  1155→            "features": {
+  1156→                "chat_completions": True,
+  1157→                "chat_completions_streaming": True,
+  1158→                "responses_api": True,
+  1159→                "responses_streaming": True,
+  1160→                "run_submission": True,
+  1161→                "run_status": True,
+  1162→                "run_events_sse": True,
+  1163→                "run_stop": True,
+  1164→                "run_approval_response": True,
+  1165→                "tool_progress_events": True,
+  1166→                "approval_events": True,
+  1167→                "session_resources": True,
+  1168→                "session_chat": True,
+  1169→                "session_chat_streaming": True,
+  1170→                "session_fork": True,
+  1171→                "admin_config_rw": False,
+  1172→                "jobs_admin": False,
+  1173→                "memory_write_api": False,
+  1174→                "skills_api": True,
+  1175→                "audio_api": False,
+  1176→                "realtime_voice": False,
+  1177→                "session_continuity_header": "X-Hermes-Session-Id",
+  1178→                "session_key_header": "X-Hermes-Session-Key",
+  1179→                "cors": bool(self._cors_origins),
+  1180→            },
+  1181→            "endpoints": {
+  1182→                "health": {"method": "GET", "path": "/health"},
+  1183→                "health_detailed": {"method": "GET", "path": "/health/detailed"},
+  1184→                "models": {"method": "GET", "path": "/v1/models"},
+  1185→                "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
+  1186→                "responses": {"method": "POST", "path": "/v1/responses"},
+  1187→                "runs": {"method": "POST", "path": "/v1/runs"},
+  1188→                "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
+  1189→                "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
+  1190→                "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
+  1191→                "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+  1192→                "skills": {"method": "GET", "path": "/v1/skills"},
+  1193→                "toolsets": {"method": "GET", "path": "/v1/toolsets"},
+  1194→                "sessions": {"method": "GET", "path": "/api/sessions"},
+  1195→                "session_create": {"method": "POST", "path": "/api/sessions"},
+  1196→                "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
+  1197→                "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
+  1198→                "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
+  1199→                "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
+  1200→                "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
+  1201→                "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
+  1202→                "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
+  1203→            },
+  1204→        })
+  1205→
+  1206→    async def _handle_skills(self, request: "web.Request") -> "web.Response":
+  1207→        """GET /v1/skills — list installed skills visible to the API-server agent.
+  1208→
+  1209→        Read-only listing intended for external clients that need to know
+  1210→        which skills are available without sending a chat message and asking
+  1211→        the model. Mirrors what the gateway/CLI surfaces through
+  1212→        ``/skills list``, but as a deterministic JSON payload.
+  1213→
+  1214→        Returns the same skill metadata (name, description, category) the
+  1215→        skills hub uses internally. Disabled skills are excluded so the
+  1216→        listing matches what the agent actually loads.
+  1217→        """
+  1218→        auth_err = self._check_auth(request)
+  1219→        if auth_err:
+  1220→            return auth_err
+  1221→
+  1222→        try:
+  1223→            from tools.skills_tool import _find_all_skills, _sort_skills
+  1224→            skills = _sort_skills(_find_all_skills(skip_disabled=False))
+  1225→        except Exception:
+  1226→            logger.exception("GET /v1/skills failed")
+  1227→            return web.json_response(
+  1228→                _openai_error("Failed to enumerate skills", err_type="server_error"),
+  1229→                status=500,
+  1230→            )
+  1231→
+  1232→        return web.json_response({
+  1233→            "object": "list",
+  1234→            "data": skills,
+  1235→        })
+  1236→
+  1237→    async def _handle_toolsets(self, request: "web.Request") -> "web.Response":
+  1238→        """GET /v1/toolsets — list toolsets and their resolved tools.
+  1239→
+  1240→        Returns the toolset surface the api_server platform actually exposes
+  1241→        to its agent: each toolset's enabled/configured state plus the
+  1242→        concrete tool names it expands to. This is the deterministic
+  1243→        equivalent of what a client would otherwise have to recover by
+  1244→        asking the model what tools it can call.
+  1245→        """
+  1246→        auth_err = self._check_auth(request)
+  1247→        if auth_err:
+  1248→            return auth_err
+  1249→
+  1250→        try:
+  1251→            from hermes_cli.config import load_config
+  1252→            from hermes_cli.tools_config import (
+  1253→                _get_effective_configurable_toolsets,
+  1254→                _get_platform_tools,
+  1255→                _toolset_has_keys,
+  1256→            )
+  1257→            from toolsets import resolve_toolset
+  1258→
+  1259→            config = load_config()
+  1260→            enabled_toolsets = _get_platform_tools(
+  1261→                config,
+  1262→                "api_server",
+  1263→                include_default_mcp_servers=False,
+  1264→            )
+  1265→            data: List[Dict[str, Any]] = []
+  1266→            for name, label, desc in _get_effective_configurable_toolsets():
+  1267→                try:
+  1268→                    tools = sorted(set(resolve_toolset(name)))
+  1269→                except Exception:
+  1270→                    tools = []
+  1271→                is_enabled = name in enabled_toolsets
+  1272→                data.append({
+  1273→                    "name": name,
+  1274→                    "label": label,
+  1275→                    "description": desc,
+  1276→                    "enabled": is_enabled,
+  1277→                    "configured": _toolset_has_keys(name, config),
+  1278→                    "tools": tools,
+  1279→                })
+  1280→        except Exception:
+  1281→            logger.exception("GET /v1/toolsets failed")
+  1282→            return web.json_response(
+  1283→                _openai_error("Failed to enumerate toolsets", err_type="server_error"),
+  1284→                status=500,
+  1285→            )
+  1286→
+  1287→        return web.json_response({
+  1288→            "object": "list",
+  1289→            "platform": "api_server",
+  1290→            "data": data,
+  1291→        })
+  1292→
+  1293→    # ------------------------------------------------------------------
+  1294→    # /api/sessions — thin client/session resource API
+  1295→    # ------------------------------------------------------------------
+  1296→
+  1297→    @staticmethod
+  1298→    def _parse_nonnegative_int(value: Any, default: int, maximum: int) -> int:
+  1299→        try:
+  1300→            parsed = int(value)
+  1301→        except (TypeError, ValueError):
+  1302→            return default
+  1303→        if parsed < 0:
+  1304→            return default
+  1305→        return min(parsed, maximum)
+  1306→
+  1307→    @staticmethod
+  1308→    def _session_response(session: Dict[str, Any]) -> Dict[str, Any]:
+  1309→        """Return a stable, client-safe session representation."""
+  1310→        safe_keys = (
+  1311→            "id", "source", "user_id", "model", "title", "started_at", "ended_at",
+  1312→            "end_reason", "message_count", "tool_call_count", "input_tokens",
+  1313→            "output_tokens", "cache_read_tokens", "cache_write_tokens",
+  1314→            "reasoning_tokens", "estimated_cost_usd", "actual_cost_usd",
+  1315→            "api_call_count", "parent_session_id", "last_active", "preview",
+  1316→            "_lineage_root_id",
+  1317→        )
+  1318→        payload = {key: session.get(key) for key in safe_keys if key in session}
+  1319→        # Avoid exposing full system prompts/model_config through the client API;
+  1320→        # callers only need to know whether those snapshots exist.
+  1321→        payload["has_system_prompt"] = bool(session.get("system_prompt"))
+  1322→        payload["has_model_config"] = bool(session.get("model_config"))
+  1323→        return payload
+  1324→
+  1325→    @staticmethod
+  1326→    def _message_response(message: Dict[str, Any]) -> Dict[str, Any]:
+  1327→        safe_keys = (
+  1328→            "id", "session_id", "role", "content", "tool_call_id", "tool_calls",
+  1329→            "tool_name", "timestamp", "token_count", "finish_reason", "reasoning",
+  1330→            "reasoning_content",
+  1331→        )
+  1332→        return {key: message.get(key) for key in safe_keys if key in message}
+  1333→
+  1334→    async def _read_json_body(self, request: "web.Request") -> tuple[Dict[str, Any], Optional["web.Response"]]:
+  1335→        try:
+  1336→            body = await request.json()
+  1337→        except Exception:
+  1338→            return {}, web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+  1339→        if not isinstance(body, dict):
+  1340→            return {}, web.json_response(_openai_error("Request body must be a JSON object"), status=400)
+  1341→        return body, None
+  1342→
+  1343→    def _get_existing_session_or_404(self, session_id: str) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+  1344→        db = self._ensure_session_db()
+  1345→        if db is None:
+  1346→            return None, web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+  1347→        session = db.get_session(session_id)
+  1348→        if not session:
+  1349→            return None, web.json_response(_openai_error(f"Session not found: {session_id}", code="session_not_found"), status=404)
+  1350→        return session, None
+  1351→
+  1352→    def _conversation_history_for_session(self, session_id: str) -> List[Dict[str, Any]]:
+  1353→        db = self._ensure_session_db()
+  1354→        if db is None:
+  1355→            return []
+  1356→        try:
+  1357→            return db.get_messages_as_conversation(session_id)
+  1358→        except Exception as exc:
+  1359→            logger.warning("Failed to load session history for %s: %s", session_id, exc)
+  1360→            return []
+  1361→
+  1362→    async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
+  1363→        """GET /api/sessions — list persisted Hermes sessions."""
+  1364→        auth_err = self._check_auth(request)
+  1365→        if auth_err:
+  1366→            return auth_err
+  1367→
+  1368→        db = self._ensure_session_db()
+  1369→        if db is None:
+  1370→            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+  1371→
+  1372→        limit = self._parse_nonnegative_int(request.query.get("limit"), default=50, maximum=200)
+  1373→        offset = self._parse_nonnegative_int(request.query.get("offset"), default=0, maximum=1_000_000)
+  1374→        source = request.query.get("source") or None
+  1375→        include_children = _coerce_request_bool(request.query.get("include_children"), default=False)
+  1376→        sessions = db.list_sessions_rich(
+  1377→            source=source,
+  1378→            limit=limit,
+  1379→            offset=offset,
+  1380→            include_children=include_children,
+  1381→            order_by_last_active=True,
+  1382→        )
+  1383→        return web.json_response({
+  1384→            "object": "list",
+  1385→            "data": [self._session_response(s) for s in sessions],
+  1386→            "limit": limit,
+  1387→            "offset": offset,
+  1388→            "has_more": len(sessions) == limit,
+  1389→        })
+  1390→
+  1391→    async def _handle_create_session(self, request: "web.Request") -> "web.Response":
+  1392→        """POST /api/sessions — create an empty Hermes session row."""
+  1393→        auth_err = self._check_auth(request)
+  1394→        if auth_err:
+  1395→            return auth_err
+  1396→        body, err = await self._read_json_body(request)
+  1397→        if err:
+  1398→            return err
+  1399→
+  1400→        db = self._ensure_session_db()
+  1401→        if db is None:
+  1402→            return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
+  1403→
+  1404→        raw_id = body.get("id") or body.get("session_id")
+  1405→        session_id = str(raw_id).strip() if raw_id else f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+  1406→        if not session_id or re.search(r'[\r\n\x00]', session_id):
+  1407→            return web.json_response(_openai_error("Invalid session ID", code="invalid_session_id"), status=400)
+  1408→        if len(session_id) > self._MAX_SESSION_HEADER_LEN:
+  1409→            return web.json_response(_openai_error("Session ID too long", code="invalid_session_id"), status=400)
+  1410→        if db.get_session(session_id):
+  1411→            return web.json_response(_openai_error(f"Session already exists: {session_id}", code="session_exists"), status=409)
+  1412→
+  1413→        model = body.get("model") or self._model_name
+  1414→        system_prompt = body.get("system_prompt")
+  1415→        if system_prompt is not None and not isinstance(system_prompt, str):
+  1416→            return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
+  1417→        db.create_session(session_id, "api_server", model=str(model) if model else None, system_prompt=system_prompt)
+  1418→        title = body.get("title")
+  1419→        if title is not None:
+  1420→            try:
+  1421→                db.set_session_title(session_id, str(title))
+  1422→            except ValueError as exc:
+  1423→                db.delete_session(session_id)
+  1424→                return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
+  1425→        session = db.get_session(session_id) or {"id": session_id, "source": "api_server", "model": model, "title": title}
+  1426→        return web.json_response({"object": "hermes.session", "session": self._session_response(session)}, status=201)
+  1427→
+  1428→    async def _handle_get_session(self, request: "web.Request") -> "web.Response":
+  1429→        """GET /api/sessions/{session_id}."""
+  1430→        auth_err = self._check_auth(request)
+  1431→        if auth_err:
+  1432→            return auth_err
+  1433→        session, err = self._get_existing_session_or_404(request.match_info["session_id"])
+  1434→        if err:
+  1435→            return err
+  1436→        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+  1437→
+  1438→    async def _handle_patch_session(self, request: "web.Request") -> "web.Response":
+  1439→        """PATCH /api/sessions/{session_id} — update client-safe session metadata."""
+  1440→        auth_err = self._check_auth(request)
+  1441→        if auth_err:
+  1442→            return auth_err
+  1443→        session_id = request.match_info["session_id"]
+  1444→        session, err = self._get_existing_session_or_404(session_id)
+  1445→        if err:
+  1446→            return err
+  1447→        body, err = await self._read_json_body(request)
+  1448→        if err:
+  1449→            return err
+  1450→        allowed = {"title", "end_reason"}
+  1451→        unknown = sorted(set(body) - allowed)
+  1452→        if unknown:
+  1453→            return web.json_response(_openai_error(f"Unsupported session fields: {', '.join(unknown)}", code="unsupported_session_field"), status=400)
+  1454→
+  1455→        db = self._ensure_session_db()
+  1456→        if "title" in body:
+  1457→            try:
+  1458→                db.set_session_title(session_id, "" if body["title"] is None else str(body["title"]))
+  1459→            except ValueError as exc:
+  1460→                return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
+  1461→        if body.get("end_reason"):
+  1462→            db.end_session(session_id, str(body["end_reason"]))
+  1463→        session = db.get_session(session_id) or session
+  1464→        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+  1465→
+  1466→    async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
+  1467→        """DELETE /api/sessions/{session_id}."""
+  1468→        auth_err = self._check_auth(request)
+  1469→        if auth_err:
+  1470→            return auth_err
+  1471→        session_id = request.match_info["session_id"]
+  1472→        session, err = self._get_existing_session_or_404(session_id)
+  1473→        if err:
+  1474→            return err
+  1475→        db = self._ensure_session_db()
+  1476→        deleted = db.delete_session(session_id)
+  1477→        return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
+  1478→
+  1479→    async def _handle_session_messages(self, request: "web.Request") -> "web.Response":
+  1480→        """GET /api/sessions/{session_id}/messages."""
+  1481→        auth_err = self._check_auth(request)
+  1482→        if auth_err:
+  1483→            return auth_err
+  1484→        session_id = request.match_info["session_id"]
+  1485→        _, err = self._get_existing_session_or_404(session_id)
+  1486→        if err:
+  1487→            return err
+  1488→        db = self._ensure_session_db()
+  1489→        resolved_id = db.resolve_resume_session_id(session_id)
+  1490→        messages = db.get_messages(resolved_id)
+  1491→        return web.json_response({
+  1492→            "object": "list",
+  1493→            "session_id": resolved_id,
+  1494→            "data": [self._message_response(m) for m in messages],
+  1495→        })
+  1496→
+  1497→    async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
+  1498→        """POST /api/sessions/{session_id}/fork — branch via current SessionDB primitives."""
+  1499→        auth_err = self._check_auth(request)
+  1500→        if auth_err:
+  1501→            return auth_err
+  1502→        source_id = request.match_info["session_id"]
+  1503→        source, err = self._get_existing_session_or_404(source_id)
+  1504→        if err:
+  1505→            return err
+  1506→        body, err = await self._read_json_body(request)
+  1507→        if err:
+  1508→            return err
+  1509→        db = self._ensure_session_db()
+  1510→        fork_id = str(body.get("id") or body.get("session_id") or f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}").strip()
+  1511→        if not fork_id or re.search(r'[\r\n\x00]', fork_id):
+  1512→            return web.json_response(_openai_error("Invalid session ID", code="invalid_session_id"), status=400)
+  1513→        if db.get_session(fork_id):
+  1514→            return web.json_response(_openai_error(f"Session already exists: {fork_id}", code="session_exists"), status=409)
+  1515→
+  1516→        # Match the CLI /branch semantics: mark the original as branched, then
+  1517→        # create a child session that carries the transcript forward. This uses
+  1518→        # SessionDB's native parent_session_id/end_reason visibility model rather
+  1519→        # than inventing a parallel fork store.
+  1520→        db.end_session(source_id, "branched")
+  1521→        db.create_session(
+  1522→            fork_id,
+  1523→            "api_server",
+  1524→            model=source.get("model"),
+  1525→            system_prompt=source.get("system_prompt"),
+  1526→            parent_session_id=source_id,
+  1527→        )
+  1528→        messages = db.get_messages(source_id)
+  1529→        db.replace_messages(fork_id, messages)
+  1530→        title = body.get("title")
+  1531→        if title is None:
+  1532→            base = source.get("title") or "fork"
+  1533→            try:
+  1534→                title = db.get_next_title_in_lineage(base)
+  1535→            except Exception:
+  1536→                title = f"{base} fork"
+  1537→        try:
+  1538→            db.set_session_title(fork_id, str(title))
+  1539→        except ValueError as exc:
+  1540→            return web.json_response(_openai_error(str(exc), code="invalid_title"), status=400)
+  1541→        fork = db.get_session(fork_id) or {"id": fork_id, "parent_session_id": source_id}
+  1542→        return web.json_response({"object": "hermes.session", "session": self._session_response(fork)}, status=201)
+  1543→
+  1544→    async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
+  1545→        """POST /api/sessions/{session_id}/chat — one synchronous agent turn."""
+  1546→        auth_err = self._check_auth(request)
+  1547→        if auth_err:
+  1548→            return auth_err
+  1549→        gateway_session_key, key_err = self._parse_session_key_header(request)
+  1550→        if key_err is not None:
+  1551→            return key_err
+  1552→        session_id = request.match_info["session_id"]
+  1553→        _, err = self._get_existing_session_or_404(session_id)
+  1554→        if err:
+  1555→            return err
+  1556→        body, err = await self._read_json_body(request)
+  1557→        if err:
+  1558→            return err
+  1559→        user_message, err = _session_chat_user_message(body)
+  1560→        if err is not None:
+  1561→            return err
+  1562→        system_prompt = body.get("system_message") or body.get("instructions")
+  1563→        if system_prompt is not None and not isinstance(system_prompt, str):
+  1564→            return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+  1565→        history = self._conversation_history_for_session(session_id)
+  1566→        result, usage = await self._run_agent(
+  1567→            user_message=user_message,
+  1568→            conversation_history=history,
+  1569→            ephemeral_system_prompt=system_prompt,
+  1570→            session_id=session_id,
+  1571→            gateway_session_key=gateway_session_key,
+  1572→        )
+  1573→        effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
+  1574→        final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+  1575→        headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
+  1576→        if gateway_session_key:
+  1577→            headers["X-Hermes-Session-Key"] = gateway_session_key
+  1578→        return web.json_response(
+  1579→            {
+  1580→                "object": "hermes.session.chat.completion",
+  1581→                "session_id": effective_session_id or session_id,
+  1582→                "message": {"role": "assistant", "content": final_response},
+  1583→                "usage": usage,
+  1584→            },
+  1585→            headers=headers,
+  1586→        )
+  1587→
+  1588→    async def _handle_session_chat_stream(self, request: "web.Request") -> "web.StreamResponse":
+  1589→        """POST /api/sessions/{session_id}/chat/stream — SSE wrapper over _run_agent."""
+  1590→        auth_err = self._check_auth(request)
+  1591→        if auth_err:
+  1592→            return auth_err
+  1593→        gateway_session_key, key_err = self._parse_session_key_header(request)
+  1594→        if key_err is not None:
+  1595→            return key_err
+  1596→        session_id = request.match_info["session_id"]
+  1597→        _, err = self._get_existing_session_or_404(session_id)
+  1598→        if err:
+  1599→            return err
+  1600→        body, err = await self._read_json_body(request)
+  1601→        if err:
+  1602→            return err
+  1603→        user_message, err = _session_chat_user_message(body)
+  1604→        if err is not None:
+  1605→            return err
+  1606→        system_prompt = body.get("system_message") or body.get("instructions")
+  1607→        if system_prompt is not None and not isinstance(system_prompt, str):
+  1608→            return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+  1609→
+  1610→        loop = asyncio.get_running_loop()
+  1611→        queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
+  1612→        message_id = f"msg_{uuid.uuid4().hex}"
+  1613→        run_id = f"run_{uuid.uuid4().hex}"
+  1614→        seq = 0
+  1615→
+  1616→        def _event_payload(name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
+  1617→            nonlocal seq
+  1618→            seq += 1
+  1619→            payload.setdefault("session_id", session_id)
+  1620→            payload.setdefault("run_id", run_id)
+  1621→            payload.setdefault("seq", seq)
+  1622→            payload.setdefault("ts", time.time())
+  1623→            return name, payload
+  1624→
+  1625→        def _enqueue(name: str, payload: Dict[str, Any]) -> None:
+  1626→            event = _event_payload(name, payload)
+  1627→            try:
+  1628→                running_loop = asyncio.get_running_loop()
+  1629→            except RuntimeError:
+  1630→                running_loop = None
+  1631→            try:
+  1632→                if running_loop is loop:
+  1633→                    queue.put_nowait(event)
+  1634→                else:
+  1635→                    loop.call_soon_threadsafe(queue.put_nowait, event)
+  1636→            except RuntimeError:
+  1637→                pass
+  1638→
+  1639→        def _delta(delta: str) -> None:
+  1640→            if delta:
+  1641→                _enqueue("assistant.delta", {"message_id": message_id, "delta": delta})
+  1642→
+  1643→        def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
+  1644→            if event_type == "reasoning.available":
+  1645→                _enqueue("tool.progress", {"message_id": message_id, "tool_name": tool_name or "_thinking", "delta": preview or ""})
+  1646→            elif event_type in {"tool.started", "tool.completed", "tool.failed"}:
+  1647→                event_name = event_type.replace("tool.", "tool.")
+  1648→                _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
+  1649→
+  1650→        async def _run_and_signal() -> None:
+  1651→            try:
+  1652→                await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
+  1653→                await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
+  1654→                history = self._conversation_history_for_session(session_id)
+  1655→                result, usage = await self._run_agent(
+  1656→                    user_message=user_message,
+  1657→                    conversation_history=history,
+  1658→                    ephemeral_system_prompt=system_prompt,
+  1659→                    session_id=session_id,
+  1660→                    stream_delta_callback=_delta,
+  1661→                    tool_progress_callback=_tool_progress,
+  1662→                    gateway_session_key=gateway_session_key,
+  1663→                )
+  1664→                final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+  1665→                effective_session_id = result.get("session_id", session_id) if isinstance(result, dict) else session_id
+  1666→                turn_messages = self._turn_transcript_messages(history, user_message, result) if isinstance(result, dict) else []
+  1667→                await queue.put(_event_payload("assistant.completed", {
+  1668→                    "session_id": effective_session_id,
+  1669→                    "message_id": message_id,
+  1670→                    "content": final_response,
+  1671→                    "completed": True,
+  1672→                    "partial": False,
+  1673→                    "interrupted": False,
+  1674→                }))
+  1675→                await queue.put(_event_payload("run.completed", {
+  1676→                    "session_id": effective_session_id,
+  1677→                    "message_id": message_id,
+  1678→                    "completed": True,
+  1679→                    "messages": turn_messages,
+  1680→                    "usage": usage,
+  1681→                }))
+  1682→            except Exception as exc:
+  1683→                logger.exception("[api_server] session chat stream failed")
+  1684→                await queue.put(_event_payload("error", {"message": str(exc)}))
+  1685→            finally:
+  1686→                await queue.put(_event_payload("done", {}))
+  1687→                await queue.put(None)
+  1688→
+  1689→        task = asyncio.create_task(_run_and_signal())
+  1690→        try:
+  1691→            self._background_tasks.add(task)
+  1692→        except TypeError:
+  1693→            pass
+  1694→        if hasattr(task, "add_done_callback"):
+  1695→            task.add_done_callback(self._background_tasks.discard)
+  1696→
+  1697→        headers = {
+  1698→            "Content-Type": "text/event-stream",
+  1699→            "Cache-Control": "no-cache",
+  1700→            "X-Accel-Buffering": "no",
+  1701→            "X-Hermes-Session-Id": session_id,
+  1702→        }
+  1703→        if gateway_session_key:
+  1704→            headers["X-Hermes-Session-Key"] = gateway_session_key
+  1705→        response = web.StreamResponse(status=200, headers=headers)
+  1706→        await response.prepare(request)
+  1707→        last_write = time.monotonic()
+  1708→        try:
+  1709→            while True:
+  1710→                try:
+  1711→                    item = await asyncio.wait_for(queue.get(), timeout=CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS)
+  1712→                except asyncio.TimeoutError:
+  1713→                    await response.write(b": keepalive\n\n")
+  1714→                    last_write = time.monotonic()
+  1715→                    continue
+  1716→                if item is None:
+  1717→                    break
+  1718→                name, payload = item
+  1719→                data = json.dumps(payload, ensure_ascii=False)
+  1720→                await response.write(f"event: {name}\ndata: {data}\n\n".encode("utf-8"))
+  1721→                last_write = time.monotonic()
+  1722→        except (asyncio.CancelledError, ConnectionResetError):
+  1723→            task.cancel()
+  1724→            raise
+  1725→        except Exception as exc:
+  1726→            logger.debug("[api_server] session SSE stream error: %s", exc)
+  1727→        return response
+  1728→
+  1729→    async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
+  1730→        """POST /v1/chat/completions — OpenAI Chat Completions format."""
+  1731→        auth_err = self._check_auth(request)
+  1732→        if auth_err:
+  1733→            return auth_err
+  1734→
+  1735→        # Parse request body
+  1736→        try:
+  1737→            body = await request.json()
+  1738→        except (json.JSONDecodeError, Exception):
+  1739→            return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+  1740→
+  1741→        messages = body.get("messages")
+  1742→        if not messages or not isinstance(messages, list):
+  1743→            return web.json_response(
+  1744→                {"error": {"message": "Missing or invalid 'messages' field", "type": "invalid_request_error"}},
+  1745→                status=400,
+  1746→            )
+  1747→
+  1748→        stream = _coerce_request_bool(body.get("stream"), default=False)
+  1749→
+  1750→        # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
+  1751→        system_prompt = None
+  1752→        conversation_messages: List[Dict[str, str]] = []
+  1753→
+  1754→        for idx, msg in enumerate(messages):
+  1755→            role = msg.get("role", "")
+  1756→            raw_content = msg.get("content", "")
+  1757→            if role == "system":
+  1758→                # System messages don't support images (Anthropic rejects, OpenAI
+  1759→                # text-model systems don't render them).  Flatten to text.
+  1760→                content = _normalize_chat_content(raw_content)
+  1761→                if system_prompt is None:
+  1762→                    system_prompt = content
+  1763→                else:
+  1764→                    system_prompt = system_prompt + "\n" + content
+  1765→            elif role in {"user", "assistant"}:
+  1766→                try:
+  1767→                    content = _normalize_multimodal_content(raw_content)
+  1768→                except ValueError as exc:
+  1769→                    return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
+  1770→                conversation_messages.append({"role": role, "content": content})
+  1771→
+  1772→        # Extract the last user message as the primary input
+  1773→        user_message: Any = ""
+  1774→        history = []
+  1775→        if conversation_messages:
+  1776→            user_message = conversation_messages[-1].get("content", "")
+  1777→            history = conversation_messages[:-1]
+  1778→
+  1779→        if not _content_has_visible_payload(user_message):
+  1780→            return web.json_response(
+  1781→                {"error": {"message": "No user message found in messages", "type": "invalid_request_error"}},
+  1782→                status=400,
+  1783→            )
+  1784→
+  1785→        # Allow caller to scope long-term memory (e.g. Honcho) with a
+  1786→        # stable per-channel identifier via X-Hermes-Session-Key.  This
+  1787→        # is independent of X-Hermes-Session-Id: the key persists across
+  1788→        # transcripts while the id rotates when the caller starts a new
+  1789→        # transcript (i.e. /new semantics).  See _parse_session_key_header.
+  1790→        gateway_session_key, key_err = self._parse_session_key_header(request)
+  1791→        if key_err is not None:
+  1792→            return key_err
+  1793→
+  1794→        # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
+  1795→        # When provided, history is loaded from state.db instead of from the request body.
+  1796→        #
+  1797→        # Security: session continuation exposes conversation history, so it is
+  1798→        # only allowed when the API key is configured and the request is
+  1799→        # authenticated.  Without this gate, any unauthenticated client could
+  1800→        # read arbitrary session history by guessing/enumerating session IDs.
+  1801→        provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
+  1802→        if provided_session_id:
+  1803→            if not self._api_key:
+  1804→                logger.warning(
+  1805→                    "Session continuation via X-Hermes-Session-Id rejected: "
+  1806→                    "no API key configured.  Set API_SERVER_KEY to enable "
+  1807→                    "session continuity."
+  1808→                )
+  1809→                return web.json_response(
+  1810→                    _openai_error(
+  1811→                        "Session continuation requires API key authentication. "
+  1812→                        "Configure API_SERVER_KEY to enable this feature."
+  1813→                    ),
+  1814→                    status=403,
+  1815→                )
+  1816→            # Sanitize: reject control characters that could enable header injection.
+  1817→            if re.search(r'[\r\n\x00]', provided_session_id):
+  1818→                return web.json_response(
+  1819→                    {"error": {"message": "Invalid session ID", "type": "invalid_request_error"}},
+  1820→                    status=400,
+  1821→                )
+  1822→            session_id = provided_session_id
+  1823→            try:
+  1824→                db = self._ensure_session_db()
+  1825→                if db is not None:
+  1826→                    history = db.get_messages_as_conversation(session_id)
+  1827→            except Exception as e:
+  1828→                logger.warning("Failed to load session history for %s: %s", session_id, e)
+  1829→                history = []
+  1830→        else:
+  1831→            # Derive a stable session ID from the conversation fingerprint so
+  1832→            # that consecutive messages from the same Open WebUI (or similar)
+  1833→            # conversation map to the same Hermes session.  The first user
+  1834→            # message + system prompt are constant across all turns.
+  1835→            first_user = ""
+  1836→            for cm in conversation_messages:
+  1837→                if cm.get("role") == "user":
+  1838→                    first_user = cm.get("content", "")
+  1839→                    break
+  1840→            session_id = _derive_chat_session_id(system_prompt, first_user)
+  1841→            # history already set from request body above
+  1842→
+  1843→        completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
+  1844→        model_name = body.get("model", self._model_name)
+  1845→        created = int(time.time())
+  1846→
+  1847→        if stream:
+  1848→            import queue as _q
+  1849→            _stream_q: _q.Queue = _q.Queue()
+  1850→
+  1851→            def _on_delta(delta):
+  1852→                # Filter out None — the agent fires stream_delta_callback(None)
+  1853→                # to signal the CLI display to close its response box before
+  1854→                # tool execution, but the SSE writer uses None as end-of-stream
+  1855→                # sentinel.  Forwarding it would prematurely close the HTTP
+  1856→                # response, causing Open WebUI (and similar frontends) to miss
+  1857→                # the final answer after tool calls.  The SSE loop detects
+  1858→                # completion via agent_task.done() instead.
+  1859→                if delta is not None:
+  1860→                    _stream_q.put(delta)
+  1861→
+  1862→            # Track which tool_call_ids we've emitted a "running" lifecycle
+  1863→            # event for, so a "completed" event without a matching "running"
+  1864→            # (e.g. internal/filtered tools) is silently dropped instead of
+  1865→            # producing an orphaned event clients can't correlate.
+  1866→            _started_tool_call_ids: set[str] = set()
+  1867→
+  1868→            def _on_tool_start(tool_call_id, function_name, function_args):
+  1869→                """Emit ``hermes.tool.progress`` with ``status: running``.
+  1870→
+  1871→                Replaces the old ``tool_progress_callback("tool.started",
+  1872→                ...)`` emit so SSE consumers receive a single event per
+  1873→                tool start, carrying both the legacy ``tool``/``emoji``/
+  1874→                ``label`` payload (for #6972 frontends) and the new
+  1875→                ``toolCallId``/``status`` correlation fields (#16588).
+  1876→
+  1877→                Skips tools whose names start with ``_`` so internal
+  1878→                events (``_thinking``, …) stay off the wire — matching
+  1879→                the prior ``_on_tool_progress`` filter exactly.
+  1880→                """
+  1881→                if not tool_call_id or function_name.startswith("_"):
+  1882→                    return
+  1883→                _started_tool_call_ids.add(tool_call_id)
+  1884→                from agent.display import build_tool_preview, get_tool_emoji
+  1885→                label = build_tool_preview(function_name, function_args) or function_name
+  1886→                _stream_q.put(("__tool_progress__", {
+  1887→                    "tool": function_name,
+  1888→                    "emoji": get_tool_emoji(function_name),
+  1889→                    "label": label,
+  1890→                    "toolCallId": tool_call_id,
+  1891→                    "status": "running",
+  1892→                }))
+  1893→
+  1894→            def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
+  1895→                """Emit the matching ``status: completed`` event.
+  1896→
+  1897→                Dropped if the start was filtered (internal tool, missing
+  1898→                id, or never seen) so clients never get an orphaned
+  1899→                ``completed`` they can't correlate to a prior ``running``.
+  1900→                """
+  1901→                if not tool_call_id or tool_call_id not in _started_tool_call_ids:
+  1902→                    return
+  1903→                _started_tool_call_ids.discard(tool_call_id)
+  1904→                _stream_q.put(("__tool_progress__", {
+  1905→                    "tool": function_name,
+  1906→                    "toolCallId": tool_call_id,
+  1907→                    "status": "completed",
+  1908→                }))
+  1909→
+  1910→            # Start agent in background.  agent_ref is a mutable container
+  1911→            # so the SSE writer can interrupt the agent on client disconnect.
+  1912→            #
+  1913→            # ``tool_progress_callback`` is intentionally not wired here:
+  1914→            # it would duplicate every emit because ``run_agent`` fires it
+  1915→            # side-by-side with ``tool_start_callback``/``tool_complete_callback``.
+  1916→            # The structured callbacks are strictly richer (they carry the
+  1917→            # tool_call id), so they own the chat-completions SSE channel.
+  1918→            agent_ref = [None]
+  1919→            agent_task = asyncio.ensure_future(self._run_agent(
+  1920→                user_message=user_message,
+  1921→                conversation_history=history,
+  1922→                ephemeral_system_prompt=system_prompt,
+  1923→                session_id=session_id,
+  1924→                stream_delta_callback=_on_delta,
+  1925→                tool_start_callback=_on_tool_start,
+  1926→                tool_complete_callback=_on_tool_complete,
+  1927→                agent_ref=agent_ref,
+  1928→                gateway_session_key=gateway_session_key,
+  1929→            ))
+  1930→            # Ensure SSE drain loops can terminate without relying on polling
+  1931→            # agent_task.done(), which can race with queue timeout checks.
+  1932→            agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
+  1933→
+  1934→            return await self._write_sse_chat_completion(
+  1935→                request, completion_id, model_name, created, _stream_q,
+  1936→                agent_task, agent_ref, session_id=session_id,
+  1937→                gateway_session_key=gateway_session_key,
+  1938→            )
+  1939→
+  1940→        # Non-streaming: run the agent (with optional Idempotency-Key)
+  1941→        async def _compute_completion():
+  1942→            return await self._run_agent(
+  1943→                user_message=user_message,
+  1944→                conversation_history=history,
+  1945→                ephemeral_system_prompt=system_prompt,
+  1946→                session_id=session_id,
+  1947→                gateway_session_key=gateway_session_key,
+  1948→            )
+  1949→
+  1950→        idempotency_key = request.headers.get("Idempotency-Key")
+  1951→        if idempotency_key:
+  1952→            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
+  1953→            try:
+  1954→                result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+  1955→            except Exception as e:
+  1956→                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
+  1957→                return web.json_response(
+  1958→                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+  1959→                    status=500,
+  1960→                )
+  1961→        else:
+  1962→            try:
+  1963→                result, usage = await _compute_completion()
+  1964→            except Exception as e:
+  1965→                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
+  1966→                return web.json_response(
+  1967→                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+  1968→                    status=500,
+  1969→                )
+  1970→
+  1971→        final_response = result.get("final_response") or ""
+  1972→        is_partial = bool(result.get("partial"))
+  1973→        is_failed = bool(result.get("failed"))
+  1974→        completed = bool(result.get("completed", True))
+  1975→        err_msg = result.get("error")
+  1976→
+  1977→        # Decide finish_reason. OpenAI uses "length" for truncation, "stop"
+  1978→        # for normal completion, and downstream SDKs accept "error" / custom
+  1979→        # codes. See issue #22496.
+  1980→        if is_partial and err_msg and "truncat" in err_msg.lower():
+  1981→            finish_reason = "length"
+  1982→        elif is_failed or (not completed and err_msg):
+  1983→            finish_reason = "error"
+  1984→        else:
+  1985→            finish_reason = "stop"
+  1986→
+  1987→        response_headers = {
+  1988→            "X-Hermes-Session-Id": result.get("session_id", session_id),
+  1989→        }
+  1990→        if gateway_session_key:
+  1991→            response_headers["X-Hermes-Session-Key"] = gateway_session_key
+  1992→
+  1993→        # Hard-fail path: no usable assistant text AND a real failure → 5xx
+  1994→        # with OpenAI-style error envelope so SDK clients raise instead of
+  1995→        # silently rendering the internal failure string as message.content.
+  1996→        if not final_response and (is_failed or is_partial):
+  1997→            err_body = _openai_error(
+  1998→                err_msg or "Agent run did not produce a response.",
+  1999→                err_type="server_error",
+  2000→                code="agent_incomplete",
+
+[showing lines 1-2000 of 4323; use offset=2001 with limit to continue reading]

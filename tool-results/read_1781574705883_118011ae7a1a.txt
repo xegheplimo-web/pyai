@@ -1,0 +1,898 @@
+     1→"""
+     2→Hermes MCP Server — expose messaging conversations as MCP tools.
+     3→
+     4→Starts a stdio MCP server that lets any MCP client (Claude Code, Cursor, Codex,
+     5→etc.) list conversations, read message history, send messages, poll for live
+     6→events, and manage approval requests across all connected platforms.
+     7→
+     8→Matches OpenClaw's 9-tool MCP channel bridge surface:
+     9→  conversations_list, conversation_get, messages_read, attachments_fetch,
+    10→  events_poll, events_wait, messages_send, permissions_list_open,
+    11→  permissions_respond
+    12→
+    13→Plus: channels_list (Hermes-specific extra)
+    14→
+    15→Usage:
+    16→    hermes mcp serve
+    17→    hermes mcp serve --verbose
+    18→
+    19→MCP client config (e.g. claude_desktop_config.json):
+    20→    {
+    21→        "mcpServers": {
+    22→            "hermes": {
+    23→                "command": "hermes",
+    24→                "args": ["mcp", "serve"]
+    25→            }
+    26→        }
+    27→    }
+    28→"""
+    29→
+    30→from __future__ import annotations
+    31→
+    32→import json
+    33→import logging
+    34→import os
+    35→import re
+    36→import sys
+    37→import threading
+    38→import time
+    39→from dataclasses import dataclass, field
+    40→from pathlib import Path
+    41→from typing import Dict, List, Optional
+    42→
+    43→logger = logging.getLogger("hermes.mcp_serve")
+    44→
+    45→# ---------------------------------------------------------------------------
+    46→# Lazy MCP SDK import
+    47→# ---------------------------------------------------------------------------
+    48→
+    49→_MCP_SERVER_AVAILABLE = False
+    50→try:
+    51→    from mcp.server.fastmcp import FastMCP
+    52→
+    53→    _MCP_SERVER_AVAILABLE = True
+    54→except ImportError:
+    55→    FastMCP = None  # type: ignore[assignment,misc]
+    56→
+    57→
+    58→# ---------------------------------------------------------------------------
+    59→# Helpers
+    60→# ---------------------------------------------------------------------------
+    61→
+    62→def _get_sessions_dir() -> Path:
+    63→    """Return the sessions directory using HERMES_HOME."""
+    64→    try:
+    65→        from hermes_constants import get_hermes_home
+    66→        return get_hermes_home() / "sessions"
+    67→    except ImportError:
+    68→        return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "sessions"
+    69→
+    70→
+    71→def _get_session_db():
+    72→    """Get a SessionDB instance for reading message transcripts."""
+    73→    try:
+    74→        from hermes_state import SessionDB
+    75→        return SessionDB()
+    76→    except Exception as e:
+    77→        logger.debug("SessionDB unavailable: %s", e)
+    78→        return None
+    79→
+    80→
+    81→def _load_sessions_index() -> dict:
+    82→    """Load the gateway sessions.json index directly.
+    83→
+    84→    Returns a dict of session_key -> entry_dict with platform routing info.
+    85→    This avoids importing the full SessionStore which needs GatewayConfig.
+    86→    """
+    87→    sessions_file = _get_sessions_dir() / "sessions.json"
+    88→    if not sessions_file.exists():
+    89→        return {}
+    90→    try:
+    91→        with open(sessions_file, "r", encoding="utf-8") as f:
+    92→            return json.load(f)
+    93→    except Exception as e:
+    94→        logger.debug("Failed to load sessions.json: %s", e)
+    95→        return {}
+    96→
+    97→
+    98→def _load_channel_directory() -> dict:
+    99→    """Load the cached channel directory for available targets."""
+   100→    try:
+   101→        from hermes_constants import get_hermes_home
+   102→        directory_file = get_hermes_home() / "channel_directory.json"
+   103→    except ImportError:
+   104→        directory_file = Path(
+   105→            os.environ.get("HERMES_HOME", Path.home() / ".hermes")
+   106→        ) / "channel_directory.json"
+   107→
+   108→    if not directory_file.exists():
+   109→        return {}
+   110→    try:
+   111→        with open(directory_file, "r", encoding="utf-8") as f:
+   112→            return json.load(f)
+   113→    except Exception as e:
+   114→        logger.debug("Failed to load channel_directory.json: %s", e)
+   115→        return {}
+   116→
+   117→
+   118→def _coerce_int(
+   119→    value,
+   120→    *,
+   121→    default: int,
+   122→    minimum: int,
+   123→    maximum: int,
+   124→) -> int:
+   125→    """Coerce value to int with fallback and clamping.
+   126→
+   127→    Used at MCP tool boundaries to handle invalid types from external clients.
+   128→    Returns default if value cannot be converted to int.
+   129→    """
+   130→    try:
+   131→        coerced = int(value)
+   132→    except (TypeError, ValueError):
+   133→        coerced = default
+   134→    return max(minimum, min(coerced, maximum))
+   135→
+   136→
+   137→def _extract_message_content(msg: dict) -> str:
+   138→    """Extract text content from a message, handling multi-part content."""
+   139→    content = msg.get("content", "")
+   140→    if isinstance(content, list):
+   141→        text_parts = [
+   142→            p.get("text", "") for p in content
+   143→            if isinstance(p, dict) and p.get("type") == "text"
+   144→        ]
+   145→        return "\n".join(text_parts)
+   146→    return str(content) if content else ""
+   147→
+   148→
+   149→def _extract_attachments(msg: dict) -> List[dict]:
+   150→    """Extract non-text attachments from a message.
+   151→
+   152→    Finds: multi-part image/file content blocks, MEDIA: tags in text,
+   153→    image URLs, and file references.
+   154→    """
+   155→    attachments = []
+   156→    content = msg.get("content", "")
+   157→
+   158→    # Multi-part content blocks (image_url, file, etc.)
+   159→    if isinstance(content, list):
+   160→        for part in content:
+   161→            if not isinstance(part, dict):
+   162→                continue
+   163→            ptype = part.get("type", "")
+   164→            if ptype == "image_url":
+   165→                url = part.get("image_url", {}).get("url", "") if isinstance(part.get("image_url"), dict) else ""
+   166→                if url:
+   167→                    attachments.append({"type": "image", "url": url})
+   168→            elif ptype == "image":
+   169→                url = part.get("url", part.get("source", {}).get("url", ""))
+   170→                if url:
+   171→                    attachments.append({"type": "image", "url": url})
+   172→            elif ptype not in {"text",}:
+   173→                # Unknown non-text content type
+   174→                attachments.append({"type": ptype, "data": part})
+   175→
+   176→    # MEDIA: tags in text content
+   177→    text = _extract_message_content(msg)
+   178→    if text:
+   179→        media_pattern = re.compile(r'MEDIA:\s*(\S+)')
+   180→        for match in media_pattern.finditer(text):
+   181→            path = match.group(1)
+   182→            attachments.append({"type": "media", "path": path})
+   183→
+   184→    return attachments
+   185→
+   186→
+   187→# ---------------------------------------------------------------------------
+   188→# Event Bridge — polls SessionDB for new messages, maintains event queue
+   189→# ---------------------------------------------------------------------------
+   190→
+   191→QUEUE_LIMIT = 1000
+   192→POLL_INTERVAL = 0.2  # seconds between DB polls (200ms)
+   193→
+   194→
+   195→@dataclass
+   196→class QueueEvent:
+   197→    """An event in the bridge's in-memory queue."""
+   198→    cursor: int
+   199→    type: str  # "message", "approval_requested", "approval_resolved"
+   200→    session_key: str = ""
+   201→    data: dict = field(default_factory=dict)
+   202→
+   203→
+   204→class EventBridge:
+   205→    """Background poller that watches SessionDB for new messages and
+   206→    maintains an in-memory event queue with waiter support.
+   207→
+   208→    This is the Hermes equivalent of OpenClaw's WebSocket gateway bridge.
+   209→    Instead of WebSocket events, we poll the SQLite database for changes.
+   210→    """
+   211→
+   212→    def __init__(self):
+   213→        self._queue: List[QueueEvent] = []
+   214→        self._cursor = 0
+   215→        self._lock = threading.Lock()
+   216→        self._new_event = threading.Event()
+   217→        self._running = False
+   218→        self._thread: Optional[threading.Thread] = None
+   219→        self._last_poll_timestamps: Dict[str, float] = {}  # session_key -> unix timestamp
+   220→        # In-memory approval tracking (populated from events)
+   221→        self._pending_approvals: Dict[str, dict] = {}
+   222→        # mtime cache — skip expensive work when files haven't changed
+   223→        self._sessions_json_mtime: float = 0.0
+   224→        self._state_db_mtime: float = 0.0
+   225→        self._cached_sessions_index: dict = {}
+   226→
+   227→    def start(self):
+   228→        """Start the background polling thread."""
+   229→        if self._running:
+   230→            return
+   231→        self._running = True
+   232→        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+   233→        self._thread.start()
+   234→        logger.debug("EventBridge started")
+   235→
+   236→    def stop(self):
+   237→        """Stop the background polling thread."""
+   238→        self._running = False
+   239→        self._new_event.set()  # Wake any waiters
+   240→        if self._thread:
+   241→            self._thread.join(timeout=5)
+   242→        logger.debug("EventBridge stopped")
+   243→
+   244→    def poll_events(
+   245→        self,
+   246→        after_cursor: int = 0,
+   247→        session_key: Optional[str] = None,
+   248→        limit: int = 20,
+   249→    ) -> dict:
+   250→        """Return events since after_cursor, optionally filtered by session_key."""
+   251→        with self._lock:
+   252→            events = [
+   253→                e for e in self._queue
+   254→                if e.cursor > after_cursor
+   255→                and (not session_key or e.session_key == session_key)
+   256→            ][:limit]
+   257→
+   258→        next_cursor = events[-1].cursor if events else after_cursor
+   259→        return {
+   260→            "events": [
+   261→                {"cursor": e.cursor, "type": e.type,
+   262→                 "session_key": e.session_key, **e.data}
+   263→                for e in events
+   264→            ],
+   265→            "next_cursor": next_cursor,
+   266→        }
+   267→
+   268→    def wait_for_event(
+   269→        self,
+   270→        after_cursor: int = 0,
+   271→        session_key: Optional[str] = None,
+   272→        timeout_ms: int = 30000,
+   273→    ) -> Optional[dict]:
+   274→        """Block until a matching event arrives or timeout expires."""
+   275→        deadline = time.monotonic() + (timeout_ms / 1000.0)
+   276→
+   277→        while time.monotonic() < deadline:
+   278→            with self._lock:
+   279→                for e in self._queue:
+   280→                    if e.cursor > after_cursor and (
+   281→                        not session_key or e.session_key == session_key
+   282→                    ):
+   283→                        return {
+   284→                            "cursor": e.cursor, "type": e.type,
+   285→                            "session_key": e.session_key, **e.data,
+   286→                        }
+   287→
+   288→            remaining = deadline - time.monotonic()
+   289→            if remaining <= 0:
+   290→                break
+   291→            self._new_event.clear()
+   292→            self._new_event.wait(timeout=min(remaining, POLL_INTERVAL))
+   293→
+   294→        return None
+   295→
+   296→    def list_pending_approvals(self) -> List[dict]:
+   297→        """List approval requests observed during this bridge session."""
+   298→        with self._lock:
+   299→            return sorted(
+   300→                self._pending_approvals.values(),
+   301→                key=lambda a: a.get("created_at", ""),
+   302→            )
+   303→
+   304→    def respond_to_approval(self, approval_id: str, decision: str) -> dict:
+   305→        """Resolve a pending approval (best-effort without gateway IPC)."""
+   306→        with self._lock:
+   307→            approval = self._pending_approvals.pop(approval_id, None)
+   308→
+   309→        if not approval:
+   310→            return {"error": f"Approval not found: {approval_id}"}
+   311→
+   312→        self._enqueue(QueueEvent(
+   313→            cursor=0,  # Will be set by _enqueue
+   314→            type="approval_resolved",
+   315→            session_key=approval.get("session_key", ""),
+   316→            data={"approval_id": approval_id, "decision": decision},
+   317→        ))
+   318→
+   319→        return {"resolved": True, "approval_id": approval_id, "decision": decision}
+   320→
+   321→    def _enqueue(self, event: QueueEvent) -> None:
+   322→        """Add an event to the queue and wake any waiters."""
+   323→        with self._lock:
+   324→            self._cursor += 1
+   325→            event.cursor = self._cursor
+   326→            self._queue.append(event)
+   327→            # Trim queue to limit
+   328→            while len(self._queue) > QUEUE_LIMIT:
+   329→                self._queue.pop(0)
+   330→        self._new_event.set()
+   331→
+   332→    def _poll_loop(self):
+   333→        """Background loop: poll SessionDB for new messages."""
+   334→        db = _get_session_db()
+   335→        if not db:
+   336→            logger.warning("EventBridge: SessionDB unavailable, event polling disabled")
+   337→            return
+   338→
+   339→        while self._running:
+   340→            try:
+   341→                self._poll_once(db)
+   342→            except Exception as e:
+   343→                logger.debug("EventBridge poll error: %s", e)
+   344→            time.sleep(POLL_INTERVAL)
+   345→
+   346→    def _poll_once(self, db):
+   347→        """Check for new messages across all sessions.
+   348→
+   349→        Uses mtime checks on sessions.json and state.db to skip work
+   350→        when nothing has changed — makes 200ms polling essentially free.
+   351→        """
+   352→        # Check if sessions.json has changed (mtime check is ~1μs)
+   353→        sessions_file = _get_sessions_dir() / "sessions.json"
+   354→        try:
+   355→            sj_mtime = sessions_file.stat().st_mtime if sessions_file.exists() else 0.0
+   356→        except OSError:
+   357→            sj_mtime = 0.0
+   358→
+   359→        if sj_mtime != self._sessions_json_mtime:
+   360→            self._sessions_json_mtime = sj_mtime
+   361→            self._cached_sessions_index = _load_sessions_index()
+   362→
+   363→        # Check if state.db has changed
+   364→        try:
+   365→            from hermes_constants import get_hermes_home
+   366→            db_file = get_hermes_home() / "state.db"
+   367→        except ImportError:
+   368→            db_file = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
+   369→
+   370→        try:
+   371→            db_mtime = db_file.stat().st_mtime if db_file.exists() else 0.0
+   372→        except OSError:
+   373→            db_mtime = 0.0
+   374→
+   375→        if db_mtime == self._state_db_mtime and sj_mtime == self._sessions_json_mtime:
+   376→            return  # Nothing changed since last poll — skip entirely
+   377→
+   378→        self._state_db_mtime = db_mtime
+   379→        entries = self._cached_sessions_index
+   380→
+   381→        for session_key, entry in entries.items():
+   382→            session_id = entry.get("session_id", "")
+   383→            if not session_id:
+   384→                continue
+   385→
+   386→            last_seen = self._last_poll_timestamps.get(session_key, 0.0)
+   387→
+   388→            try:
+   389→                messages = db.get_messages(session_id)
+   390→            except Exception:
+   391→                continue
+   392→
+   393→            if not messages:
+   394→                continue
+   395→
+   396→            # Normalize timestamps to float for comparison
+   397→            def _ts_float(ts) -> float:
+   398→                if isinstance(ts, (int, float)):
+   399→                    return float(ts)
+   400→                if isinstance(ts, str) and ts:
+   401→                    try:
+   402→                        return float(ts)
+   403→                    except ValueError:
+   404→                        # ISO string — parse to epoch
+   405→                        try:
+   406→                            from datetime import datetime
+   407→                            return datetime.fromisoformat(ts).timestamp()
+   408→                        except Exception:
+   409→                            return 0.0
+   410→                return 0.0
+   411→
+   412→            # Find messages newer than our last seen timestamp
+   413→            new_messages = []
+   414→            for msg in messages:
+   415→                ts = _ts_float(msg.get("timestamp", 0))
+   416→                role = msg.get("role", "")
+   417→                if role not in {"user", "assistant"}:
+   418→                    continue
+   419→                if ts > last_seen:
+   420→                    new_messages.append(msg)
+   421→
+   422→            for msg in new_messages:
+   423→                content = _extract_message_content(msg)
+   424→                if not content:
+   425→                    continue
+   426→                self._enqueue(QueueEvent(
+   427→                    cursor=0,
+   428→                    type="message",
+   429→                    session_key=session_key,
+   430→                    data={
+   431→                        "role": msg.get("role", ""),
+   432→                        "content": content[:500],
+   433→                        "timestamp": str(msg.get("timestamp", "")),
+   434→                        "message_id": str(msg.get("id", "")),
+   435→                    },
+   436→                ))
+   437→
+   438→            # Update last seen to the most recent message timestamp
+   439→            all_ts = [_ts_float(m.get("timestamp", 0)) for m in messages]
+   440→            if all_ts:
+   441→                latest = max(all_ts)
+   442→                if latest > last_seen:
+   443→                    self._last_poll_timestamps[session_key] = latest
+   444→
+   445→
+   446→# ---------------------------------------------------------------------------
+   447→# MCP Server
+   448→# ---------------------------------------------------------------------------
+   449→
+   450→def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
+   451→    """Create and return the Hermes MCP server with all tools registered."""
+   452→    if not _MCP_SERVER_AVAILABLE:
+   453→        raise ImportError(
+   454→            "MCP server requires the 'mcp' package. "
+   455→            f"Install with: {sys.executable} -m pip install 'mcp'"
+   456→        )
+   457→
+   458→    mcp = FastMCP(
+   459→        "hermes",
+   460→        instructions=(
+   461→            "Hermes Agent messaging bridge. Use these tools to interact with "
+   462→            "conversations across Telegram, Discord, Slack, WhatsApp, Signal, "
+   463→            "Matrix, and other connected platforms."
+   464→        ),
+   465→    )
+   466→
+   467→    bridge = event_bridge or EventBridge()
+   468→
+   469→    # -- conversations_list ------------------------------------------------
+   470→
+   471→    @mcp.tool()
+   472→    def conversations_list(
+   473→        platform: Optional[str] = None,
+   474→        limit: int = 50,
+   475→        search: Optional[str] = None,
+   476→    ) -> str:
+   477→        """List active messaging conversations across connected platforms.
+   478→
+   479→        Returns conversations with their session keys (needed for messages_read),
+   480→        platform, chat type, display name, and last activity time.
+   481→
+   482→        Args:
+   483→            platform: Filter by platform name (telegram, discord, slack, etc.)
+   484→            limit: Maximum number of conversations to return (default 50)
+   485→            search: Optional text to filter conversations by name
+   486→        """
+   487→        limit = _coerce_int(limit, default=50, minimum=1, maximum=200)
+   488→        entries = _load_sessions_index()
+   489→        conversations = []
+   490→
+   491→        for key, entry in entries.items():
+   492→            origin = entry.get("origin", {})
+   493→            entry_platform = entry.get("platform") or origin.get("platform", "")
+   494→
+   495→            if platform and entry_platform.lower() != platform.lower():
+   496→                continue
+   497→
+   498→            display_name = entry.get("display_name", "")
+   499→            chat_name = origin.get("chat_name", "")
+   500→            if search:
+   501→                search_lower = search.lower()
+   502→                if (search_lower not in display_name.lower()
+   503→                        and search_lower not in chat_name.lower()
+   504→                        and search_lower not in key.lower()):
+   505→                    continue
+   506→
+   507→            conversations.append({
+   508→                "session_key": key,
+   509→                "session_id": entry.get("session_id", ""),
+   510→                "platform": entry_platform,
+   511→                "chat_type": entry.get("chat_type", origin.get("chat_type", "")),
+   512→                "display_name": display_name,
+   513→                "chat_name": chat_name,
+   514→                "user_name": origin.get("user_name", ""),
+   515→                "updated_at": entry.get("updated_at", ""),
+   516→            })
+   517→
+   518→        conversations.sort(key=lambda c: c.get("updated_at", ""), reverse=True)
+   519→        conversations = conversations[:limit]
+   520→
+   521→        return json.dumps({
+   522→            "count": len(conversations),
+   523→            "conversations": conversations,
+   524→        }, indent=2)
+   525→
+   526→    # -- conversation_get --------------------------------------------------
+   527→
+   528→    @mcp.tool()
+   529→    def conversation_get(session_key: str) -> str:
+   530→        """Get detailed info about one conversation by its session key.
+   531→
+   532→        Args:
+   533→            session_key: The session key from conversations_list
+   534→        """
+   535→        entries = _load_sessions_index()
+   536→        entry = entries.get(session_key)
+   537→
+   538→        if not entry:
+   539→            return json.dumps({"error": f"Conversation not found: {session_key}"})
+   540→
+   541→        origin = entry.get("origin", {})
+   542→        return json.dumps({
+   543→            "session_key": session_key,
+   544→            "session_id": entry.get("session_id", ""),
+   545→            "platform": entry.get("platform") or origin.get("platform", ""),
+   546→            "chat_type": entry.get("chat_type", origin.get("chat_type", "")),
+   547→            "display_name": entry.get("display_name", ""),
+   548→            "user_name": origin.get("user_name", ""),
+   549→            "chat_name": origin.get("chat_name", ""),
+   550→            "chat_id": origin.get("chat_id", ""),
+   551→            "thread_id": origin.get("thread_id"),
+   552→            "updated_at": entry.get("updated_at", ""),
+   553→            "created_at": entry.get("created_at", ""),
+   554→            "input_tokens": entry.get("input_tokens", 0),
+   555→            "output_tokens": entry.get("output_tokens", 0),
+   556→            "total_tokens": entry.get("total_tokens", 0),
+   557→        }, indent=2)
+   558→
+   559→    # -- messages_read -----------------------------------------------------
+   560→
+   561→    @mcp.tool()
+   562→    def messages_read(
+   563→        session_key: str,
+   564→        limit: int = 50,
+   565→    ) -> str:
+   566→        """Read recent messages from a conversation.
+   567→
+   568→        Returns the message history in chronological order with role, content,
+   569→        and timestamp for each message.
+   570→
+   571→        Args:
+   572→            session_key: The session key from conversations_list
+   573→            limit: Maximum number of messages to return (default 50, most recent)
+   574→        """
+   575→        limit = _coerce_int(limit, default=50, minimum=1, maximum=200)
+   576→        entries = _load_sessions_index()
+   577→        entry = entries.get(session_key)
+   578→        if not entry:
+   579→            return json.dumps({"error": f"Conversation not found: {session_key}"})
+   580→
+   581→        session_id = entry.get("session_id", "")
+   582→        if not session_id:
+   583→            return json.dumps({"error": "No session ID for this conversation"})
+   584→
+   585→        db = _get_session_db()
+   586→        if not db:
+   587→            return json.dumps({"error": "Session database unavailable"})
+   588→
+   589→        try:
+   590→            all_messages = db.get_messages(session_id)
+   591→        except Exception as e:
+   592→            return json.dumps({"error": f"Failed to read messages: {e}"})
+   593→
+   594→        filtered = []
+   595→        for msg in all_messages:
+   596→            role = msg.get("role", "")
+   597→            if role in {"user", "assistant"}:
+   598→                content = _extract_message_content(msg)
+   599→                if content:
+   600→                    filtered.append({
+   601→                        "id": str(msg.get("id", "")),
+   602→                        "role": role,
+   603→                        "content": content[:2000],
+   604→                        "timestamp": msg.get("timestamp", ""),
+   605→                    })
+   606→
+   607→        messages = filtered[-limit:]
+   608→
+   609→        return json.dumps({
+   610→            "session_key": session_key,
+   611→            "count": len(messages),
+   612→            "total_in_session": len(filtered),
+   613→            "messages": messages,
+   614→        }, indent=2)
+   615→
+   616→    # -- attachments_fetch -------------------------------------------------
+   617→
+   618→    @mcp.tool()
+   619→    def attachments_fetch(
+   620→        session_key: str,
+   621→        message_id: str,
+   622→    ) -> str:
+   623→        """List non-text attachments for a message in a conversation.
+   624→
+   625→        Extracts images, media files, and other non-text content blocks
+   626→        from the specified message.
+   627→
+   628→        Args:
+   629→            session_key: The session key from conversations_list
+   630→            message_id: The message ID from messages_read
+   631→        """
+   632→        entries = _load_sessions_index()
+   633→        entry = entries.get(session_key)
+   634→        if not entry:
+   635→            return json.dumps({"error": f"Conversation not found: {session_key}"})
+   636→
+   637→        session_id = entry.get("session_id", "")
+   638→        if not session_id:
+   639→            return json.dumps({"error": "No session ID for this conversation"})
+   640→
+   641→        db = _get_session_db()
+   642→        if not db:
+   643→            return json.dumps({"error": "Session database unavailable"})
+   644→
+   645→        try:
+   646→            all_messages = db.get_messages(session_id)
+   647→        except Exception as e:
+   648→            return json.dumps({"error": f"Failed to read messages: {e}"})
+   649→
+   650→        # Find the target message
+   651→        target_msg = None
+   652→        for msg in all_messages:
+   653→            if str(msg.get("id", "")) == message_id:
+   654→                target_msg = msg
+   655→                break
+   656→
+   657→        if not target_msg:
+   658→            return json.dumps({"error": f"Message not found: {message_id}"})
+   659→
+   660→        attachments = _extract_attachments(target_msg)
+   661→
+   662→        return json.dumps({
+   663→            "message_id": message_id,
+   664→            "count": len(attachments),
+   665→            "attachments": attachments,
+   666→        }, indent=2)
+   667→
+   668→    # -- events_poll -------------------------------------------------------
+   669→
+   670→    @mcp.tool()
+   671→    def events_poll(
+   672→        after_cursor: int = 0,
+   673→        session_key: Optional[str] = None,
+   674→        limit: int = 20,
+   675→    ) -> str:
+   676→        """Poll for new conversation events since a cursor position.
+   677→
+   678→        Returns events that have occurred since the given cursor. Use the
+   679→        returned next_cursor value for subsequent polls.
+   680→
+   681→        Event types: message, approval_requested, approval_resolved
+   682→
+   683→        Args:
+   684→            after_cursor: Return events after this cursor (0 for all)
+   685→            session_key: Optional filter to one conversation
+   686→            limit: Maximum events to return (default 20)
+   687→        """
+   688→        after_cursor = _coerce_int(after_cursor, default=0, minimum=0, maximum=10**18)
+   689→        limit = _coerce_int(limit, default=20, minimum=1, maximum=200)
+   690→        result = bridge.poll_events(
+   691→            after_cursor=after_cursor,
+   692→            session_key=session_key,
+   693→            limit=limit,
+   694→        )
+   695→        return json.dumps(result, indent=2)
+   696→
+   697→    # -- events_wait -------------------------------------------------------
+   698→
+   699→    @mcp.tool()
+   700→    def events_wait(
+   701→        after_cursor: int = 0,
+   702→        session_key: Optional[str] = None,
+   703→        timeout_ms: int = 30000,
+   704→    ) -> str:
+   705→        """Wait for the next conversation event (long-poll).
+   706→
+   707→        Blocks until a matching event arrives or the timeout expires.
+   708→        Use this for near-real-time event delivery without polling.
+   709→
+   710→        Args:
+   711→            after_cursor: Wait for events after this cursor
+   712→            session_key: Optional filter to one conversation
+   713→            timeout_ms: Maximum wait time in milliseconds (default 30000)
+   714→        """
+   715→        after_cursor = _coerce_int(after_cursor, default=0, minimum=0, maximum=10**18)
+   716→        timeout_ms = _coerce_int(
+   717→            timeout_ms,
+   718→            default=30000,
+   719→            minimum=0,
+   720→            maximum=300000,
+   721→        )  # Cap at 5 minutes
+   722→        event = bridge.wait_for_event(
+   723→            after_cursor=after_cursor,
+   724→            session_key=session_key,
+   725→            timeout_ms=timeout_ms,
+   726→        )
+   727→        if event:
+   728→            return json.dumps({"event": event}, indent=2)
+   729→        return json.dumps({"event": None, "reason": "timeout"}, indent=2)
+   730→
+   731→    # -- messages_send -----------------------------------------------------
+   732→
+   733→    @mcp.tool()
+   734→    def messages_send(
+   735→        target: str,
+   736→        message: str,
+   737→    ) -> str:
+   738→        """Send a message to a platform conversation.
+   739→
+   740→        The target format is "platform:chat_id" — same format used by the
+   741→        channels_list tool. You can also use human-friendly channel names
+   742→        that will be resolved automatically.
+   743→
+   744→        Examples:
+   745→            target="telegram:6308981865"
+   746→            target="discord:#general"
+   747→            target="slack:#engineering"
+   748→
+   749→        Args:
+   750→            target: Platform target in "platform:identifier" format
+   751→            message: The message text to send
+   752→        """
+   753→        if not target or not message:
+   754→            return json.dumps({"error": "Both target and message are required"})
+   755→
+   756→        try:
+   757→            from tools.send_message_tool import send_message_tool
+   758→            result_str = send_message_tool(
+   759→                {"action": "send", "target": target, "message": message}
+   760→            )
+   761→            return result_str
+   762→        except ImportError:
+   763→            return json.dumps({"error": "Send message tool not available"})
+   764→        except Exception as e:
+   765→            return json.dumps({"error": f"Send failed: {e}"})
+   766→
+   767→    # -- channels_list -----------------------------------------------------
+   768→
+   769→    @mcp.tool()
+   770→    def channels_list(platform: Optional[str] = None) -> str:
+   771→        """List available messaging channels and targets across platforms.
+   772→
+   773→        Returns channels that you can send messages to. The target strings
+   774→        returned here can be used directly with the messages_send tool.
+   775→
+   776→        Args:
+   777→            platform: Filter by platform name (telegram, discord, slack, etc.)
+   778→        """
+   779→        directory = _load_channel_directory()
+   780→        if not directory:
+   781→            entries = _load_sessions_index()
+   782→            targets = []
+   783→            seen = set()
+   784→            for key, entry in entries.items():
+   785→                origin = entry.get("origin", {})
+   786→                p = entry.get("platform") or origin.get("platform", "")
+   787→                chat_id = origin.get("chat_id", "")
+   788→                if not p or not chat_id:
+   789→                    continue
+   790→                if platform and p.lower() != platform.lower():
+   791→                    continue
+   792→                target_str = f"{p}:{chat_id}"
+   793→                if target_str in seen:
+   794→                    continue
+   795→                seen.add(target_str)
+   796→                targets.append({
+   797→                    "target": target_str,
+   798→                    "platform": p,
+   799→                    "name": entry.get("display_name") or origin.get("chat_name", ""),
+   800→                    "chat_type": entry.get("chat_type", origin.get("chat_type", "")),
+   801→                })
+   802→            return json.dumps({"count": len(targets), "channels": targets}, indent=2)
+   803→
+   804→        channels = []
+   805→        for plat, entries_list in directory.get("platforms", {}).items():
+   806→            if platform and plat.lower() != platform.lower():
+   807→                continue
+   808→            if isinstance(entries_list, list):
+   809→                for ch in entries_list:
+   810→                    if isinstance(ch, dict):
+   811→                        chat_id = ch.get("id", ch.get("chat_id", ""))
+   812→                        channels.append({
+   813→                            "target": f"{plat}:{chat_id}" if chat_id else plat,
+   814→                            "platform": plat,
+   815→                            "name": ch.get("name", ch.get("display_name", "")),
+   816→                            "chat_type": ch.get("type", ""),
+   817→                        })
+   818→
+   819→        return json.dumps({"count": len(channels), "channels": channels}, indent=2)
+   820→
+   821→    # -- permissions_list_open ---------------------------------------------
+   822→
+   823→    @mcp.tool()
+   824→    def permissions_list_open() -> str:
+   825→        """List pending approval requests observed during this bridge session.
+   826→
+   827→        Returns exec and plugin approval requests that the bridge has seen
+   828→        since it started. Approvals are live-session only — older approvals
+   829→        from before the bridge connected are not included.
+   830→        """
+   831→        approvals = bridge.list_pending_approvals()
+   832→        return json.dumps({
+   833→            "count": len(approvals),
+   834→            "approvals": approvals,
+   835→        }, indent=2)
+   836→
+   837→    # -- permissions_respond -----------------------------------------------
+   838→
+   839→    @mcp.tool()
+   840→    def permissions_respond(
+   841→        id: str,
+   842→        decision: str,
+   843→    ) -> str:
+   844→        """Respond to a pending approval request.
+   845→
+   846→        Args:
+   847→            id: The approval ID from permissions_list_open
+   848→            decision: One of "allow-once", "allow-always", or "deny"
+   849→        """
+   850→        if decision not in {"allow-once", "allow-always", "deny"}:
+   851→            return json.dumps({
+   852→                "error": f"Invalid decision: {decision}. "
+   853→                         f"Must be allow-once, allow-always, or deny"
+   854→            })
+   855→
+   856→        result = bridge.respond_to_approval(id, decision)
+   857→        return json.dumps(result, indent=2)
+   858→
+   859→    return mcp
+   860→
+   861→
+   862→# ---------------------------------------------------------------------------
+   863→# Entry point
+   864→# ---------------------------------------------------------------------------
+   865→
+   866→def run_mcp_server(verbose: bool = False) -> None:
+   867→    """Start the Hermes MCP server on stdio."""
+   868→    if not _MCP_SERVER_AVAILABLE:
+   869→        print(
+   870→            "Error: MCP server requires the 'mcp' package.\n"
+   871→            f"Install with: {sys.executable} -m pip install 'mcp'",
+   872→            file=sys.stderr,
+   873→        )
+   874→        sys.exit(1)
+   875→
+   876→    if verbose:
+   877→        logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
+   878→    else:
+   879→        logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
+   880→
+   881→    bridge = EventBridge()
+   882→    bridge.start()
+   883→
+   884→    server = create_mcp_server(event_bridge=bridge)
+   885→
+   886→    import asyncio
+   887→
+   888→    async def _run():
+   889→        try:
+   890→            await server.run_stdio_async()
+   891→        finally:
+   892→            bridge.stop()
+   893→
+   894→    try:
+   895→        asyncio.run(_run())
+   896→    except KeyboardInterrupt:
+   897→        bridge.stop()
+   898→
