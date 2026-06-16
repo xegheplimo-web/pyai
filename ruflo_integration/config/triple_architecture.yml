@@ -1,0 +1,286 @@
+# ============================================================
+# MAS-OpenClaw × Ruflo × Hive — Triple Integration Architecture
+# ============================================================
+#
+# KIẾN TRÚC 3 TẦNG:
+#
+# ┌─────────────────────────────────────────────┐
+# │  OPENCLAW (Gateway Layer)                    │
+# │  Telegram, WhatsApp, Web UI, CLI             │
+# │  Routing, Sessions, Skills, Cron             │
+# └──────────────────┬──────────────────────────┘
+#                    │
+# ┌──────────────────▼──────────────────────────┐
+# │  RUFLO (Orchestration Layer)                 │
+# │  Swarm Coordination, SPARC Methodology       │
+# │  AgentDB + HNSW Memory, SONA Learning        │
+# │  311 MCP Tools, Multi-Provider Routing       │
+# │  Consensus: Raft / Byzantine / Gossip        │
+# └──────────────────┬──────────────────────────┘
+#                    │
+# ┌──────────────────▼──────────────────────────┐
+# │  HIVE (Production Runtime Layer)             │
+# │  Execution Sandbox, Crash Recovery           │
+# │  Judge Evaluation, Agent Evolution           │
+# │  Cost Enforcement, Human-in-the-Loop         │
+# └─────────────────────────────────────────────┘
+#
+# INTEGRATION POINTS:
+# 1. OpenClaw → Ruflo: Message routing → Swarm initiation
+# 2. Ruflo → Hive: Agent tasks → Execution sandbox
+# 3. Shared Skills: SKILL.md format compatible
+# 4. Shared Memory: OpenClaw (Markdown) + Ruflo (AgentDB HNSW)
+# 5. Shared Tools: SearXNG search exposed via MCP
+# ============================================================
+
+# --- OpenClaw Gateway Configuration ---
+openclaw:
+  channels:
+    - telegram
+    - web_ui
+    - cli
+    - api
+  routing:
+    default_orchestrator: ruflo  # Route to Ruflo for complex tasks
+    simple_queries: local_model  # Handle simple queries with local Qwen
+  skills_dir: "./skills"
+  memory:
+    backend: "markdown"  # Markdown for per-agent continuity
+    shared_with_ruflo: true  # Ruflo can read OpenClaw memory
+
+# --- Ruflo Orchestration Configuration ---
+ruflo:
+  enabled: true
+  npm_package: "claude-flow"
+  version: ">=3.6.0"
+  
+  # Swarm Configuration
+  swarm:
+    default_topology: "adaptive"  # hierarchical | mesh | ring | star | adaptive
+    max_agents: 20
+    consensus_protocol: "raft"  # raft | byzantine | gossip
+    
+    # Queens (Coordinators)
+    queens:
+      coordinator:
+        enabled: true
+        model: "ollama/qwen2.5:14b"
+      consensus:
+        enabled: true
+        model: "ollama/qwen2.5:14b"
+    
+    # Workers (Specialized Agents)
+    workers:
+      researcher:
+        model: "ollama/qwen2.5:14b"
+        tools: ["searxng_search", "multi_category_search", "web_scraper"]
+        description: "Tìm kiếm & nghiên cứu đa nguồn"
+      
+      coder:
+        model: "ollama/qwen2.5:14b"
+        tools: ["searxng_search", "web_scraper", "document_reader"]
+        description: "Viết & review code"
+      
+      analyst:
+        model: "ollama/qwen2.5:14b"
+        tools: ["searxng_search", "web_scraper"]
+        description: "Phân tích chéo, xác minh thông tin"
+      
+      writer:
+        model: "ollama/qwen2.5:14b"
+        tools: []
+        description: "Tổng hợp & trình bày kết quả"
+      
+      tester:
+        model: "ollama/qwen2.5:3b"  # Light model for testing
+        tools: []
+        description: "Kiểm tra chất lượng đầu ra"
+      
+      security:
+        model: "ollama/qwen2.5:14b"
+        tools: ["searxng_search"]
+        description: "Audit bảo mật"
+
+  # Memory Configuration (AgentDB + HNSW)
+  memory:
+    backend: "sqlite"  # sqlite | postgres | qdrant | weaviate
+    vector_dimensions: 1536
+    hnsw:
+      ef_construction: 200
+      M: 16
+    enable_sona: true  # Self-Optimizing Neural Architecture
+    enable_reasoning_bank: true
+    shared_with_openclaw: true
+
+  # Multi-Provider LLM Routing
+  llm_routing:
+    # Simple tasks → light model (saves cost & time)
+    routing_tasks: "ollama/qwen2.5:3b"
+    search_keywords: "ollama/qwen2.5:3b"
+    formatting: "ollama/qwen2.5:3b"
+    
+    # Complex tasks → heavy model
+    analysis: "ollama/qwen2.5:14b"
+    synthesis: "ollama/qwen2.5:14b"
+    coding: "ollama/qwen2.5:14b"
+    verification: "ollama/qwen2.5:14b"
+    
+    # Optional cloud models for special cases
+    # long_context: "google/gemini-2.0-flash"  # 1M context
+    # coding_elite: "anthropic/claude-sonnet-4"  # Best code quality
+
+  # SPARC Methodology
+  sparc:
+    enabled: true
+    phases:
+      - specification
+      - pseudocode
+      - architecture
+      - refinement
+      - completion
+
+  # Federation (multi-machine)
+  federation:
+    enabled: false  # Enable for multi-machine deployment
+    protocol: "wss"
+    port: 8443
+    auth: "mtls"  # mtls | ed25519
+    pii_detection: true
+
+  # MCP Tools (311+ from Ruflo + 5 from MAS-OpenClaw)
+  mcp:
+    external_tools:
+      - name: "searxng_search"
+        server: "mas-openclaw-mcp"
+      - name: "multi_category_search"
+        server: "mas-openclaw-mcp"
+      - name: "web_scraper"
+        server: "mas-openclaw-mcp"
+      - name: "batch_web_scraper"
+        server: "mas-openclaw-mcp"
+      - name: "document_reader"
+        server: "mas-openclaw-mcp"
+
+# --- Hive Production Runtime Configuration ---
+hive:
+  enabled: true
+  
+  # Default LLM - Qwen2.5:14b local via Ollama
+  default_provider: "ollama"
+  default_model: "qwen2.5:14b"
+  
+  # Agents registered from Ruflo swarm
+  agents:
+    orchestrator:
+      role: "queen"
+      model: "ollama/qwen2.5:14b"
+      success_criteria:
+        - criterion: "Kế hoạch đầy đủ"
+          weight: 0.5
+        - criterion: "Từ khóa tối ưu VI + EN"
+          weight: 0.3
+        - criterion: "Nguồn phù hợp"
+          weight: 0.2
+    
+    search:
+      role: "worker"
+      model: "ollama/qwen2.5:14b"
+      tools: ["searxng_search", "multi_category_search"]
+    
+    research:
+      role: "worker"
+      model: "ollama/qwen2.5:14b"
+      tools: ["web_scraper", "batch_web_scraper", "document_reader"]
+    
+    analysis:
+      role: "worker"
+      model: "ollama/qwen2.5:14b"
+      tools: ["searxng_search", "web_scraper"]
+    
+    response:
+      role: "worker"
+      model: "ollama/qwen2.5:14b"
+  
+  # Judge (evaluates quality)
+  judge:
+    model: "ollama/qwen2.5:14b"
+    evaluation_interval: 120
+    degradation_patterns:
+      - "doom_loop"
+      - "stall"
+      - "excessive_retry"
+      - "low_quality"
+  
+  # Edges (flow control)
+  edges:
+    - from: "orchestrator"
+      to: "search"
+      condition: "success"
+    - from: "search"
+      to: "research"
+      condition: "success"
+    - from: "research"
+      to: "analysis"
+      condition: "success"
+    - from: "analysis"
+      to: "response"
+      condition: "success"
+    - from: "search"
+      to: "orchestrator"
+      condition: "failure"
+      label: "replan_search"
+  
+  # Evolution
+  evolution:
+    enabled: true
+    trigger: "failure"
+    scope: ["prompts", "edges", "tools"]
+    max_evolution_rounds: 3
+  
+  # Recovery
+  recovery:
+    enabled: true
+    checkpoint_interval: 30
+    max_recovery_attempts: 2
+  
+  # Cost (free with local models!)
+  cost:
+    max_tokens_per_run: 100000
+    max_cost_per_run: 0.0
+
+# --- SearXNG Search ---
+searxng:
+  host: "http://localhost:8888"
+  categories: ["general", "news", "science", "it", "social media"]
+  engines: ["google", "bing", "duckduckgo", "brave", "wikipedia", "arxiv", "github", "stackoverflow", "reddit"]
+
+# --- Ollama ---
+ollama:
+  host: "http://localhost:11434"
+  models:
+    light: "qwen2.5:3b"   # ~2GB VRAM, routing & simple tasks
+    heavy: "qwen2.5:14b"  # ~8.5GB VRAM, deep work
+  gpu_layers: 99
+  num_parallel: 4
+  flash_attention: true
+  num_ctx: 16384
+
+# --- Integration Bridges ---
+bridges:
+  openclaw_to_ruflo:
+    # OpenClaw message → Ruflo swarm initiation
+    message_format: "json"
+    session_mapping: true
+    skill_compatibility: true
+  
+  ruflo_to_hive:
+    # Ruflo agent tasks → Hive execution sandbox
+    task_format: "agent_graph"
+    mcp_tool_bridge: true
+    memory_sync: true
+  
+  shared_memory:
+    # OpenClaw Markdown ↔ Ruflo AgentDB
+    openclaw_writes: ["MEMORY.md", "memory/", "DREAMS.md"]
+    ruflo_reads: ["AgentDB", "HNSW index"]
+    sync_interval: 30  # seconds

@@ -1,0 +1,88 @@
+# ============================================================
+# MAS-OpenClaw Docker Compose
+# Services: SearXNG (meta search) + Ollama (LLM inference)
+# ============================================================
+
+version: "3.8"
+
+services:
+  # --- SearXNG: Privacy-respecting meta search engine ---
+  # Aggregates results from Google, Bing, DuckDuckGo, Wikipedia, etc.
+  searxng:
+    image: searxng/searxng:latest
+    container_name: mas-searxng
+    restart: unless-stopped
+    ports:
+      - "8888:8080"
+    volumes:
+      - ./config/searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8888/
+      - SEARXNG_SECRET=${SEARXNG_SECRET:-changeme}
+    networks:
+      - mas-network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # --- Ollama: Local LLM inference ---
+  # Runs Qwen2.5:14b on RTX 3090 with CUDA acceleration
+  ollama:
+    image: ollama/ollama:latest
+    container_name: mas-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_NUM_GPU_LAYERS=${OLLAMA_NUM_GPU_LAYERS:-99}
+      - OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-4}
+      - OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-1}
+      - OLLAMA_FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-true}
+      - OLLAMA_NUM_CTX=${OLLAMA_NUM_CTX:-16384}
+      - NVIDIA_VISIBLE_DEVICES=0
+    networks:
+      - mas-network
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # --- OLLAMA Model Puller (one-shot) ---
+  ollama-puller:
+    image: ollama/ollama:latest
+    container_name: mas-ollama-puller
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+        echo '⏳ Pulling Qwen2.5:14b model...' &&
+        ollama pull qwen2.5:14b &&
+        echo '✅ Model ready!'
+      "
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    networks:
+      - mas-network
+
+networks:
+  mas-network:
+    driver: bridge
+
+volumes:
+  ollama-data:
+    driver: local
