@@ -9,7 +9,9 @@ import {
   Send, RotateCcw, Sparkles, Layers, Code2, Shield,
   Eye, Image, Mic, Search, Wrench, Bot, ArrowRight,
   CheckCircle2, XCircle, Clock, FolderOpen, FileText,
-  LayoutDashboard, Settings, RefreshCw, ChevronDown, CpuIcon
+  LayoutDashboard, Settings, RefreshCw, ChevronDown,
+  MapPin, ExternalLink, Phone, Building2, FileCheck,
+  BookOpen, Lightbulb, Loader2
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -18,6 +20,17 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Separator } from '@/components/ui/separator';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+import dynamic from 'next/dynamic';
+
+// Dynamic import for Leaflet map (no SSR)
+const MapComponent = dynamic(() => import('@/components/MapComponent'), {
+  ssr: false,
+  loading: () => (
+    <div className="w-full h-full min-h-[300px] rounded-xl bg-slate-800/50 flex items-center justify-center">
+      <div className="text-slate-500 text-sm">Đang tải bản đồ...</div>
+    </div>
+  ),
+});
 
 // Types
 interface HermesStatus {
@@ -49,6 +62,36 @@ interface Toolset {
   name: string;
   description: string;
   tools: string[];
+}
+
+// Search types
+interface SearchSource {
+  id: number;
+  url: string;
+  name: string;
+  snippet: string;
+  host_name?: string;
+  date?: string;
+}
+
+interface SearchPlace {
+  id: number | string;
+  name: string;
+  fullAddress: string;
+  lat: number;
+  lon: number;
+  type?: string;
+  category?: string;
+  phone?: string | null;
+  website?: string | null;
+  openingHours?: string | null;
+}
+
+interface SearchResult {
+  answer: string;
+  sources: SearchSource[];
+  places: SearchPlace[];
+  query: string;
 }
 
 // Available models configuration
@@ -128,6 +171,12 @@ export default function Home() {
   const [selectedSession, setSelectedSession] = useState<string | null>(null);
   const [selectedModel, setSelectedModel] = useState('qwen3.5-flash');
   const [showModelPicker, setShowModelPicker] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchMode, setSearchMode] = useState<'smart' | 'places' | 'business'>('smart');
+  const [searchResult, setSearchResult] = useState<SearchResult | null>(null);
+  const [isSearching, setIsSearching] = useState(false);
+  const [selectedSearchPlace, setSelectedSearchPlace] = useState<SearchPlace | null>(null);
+  const [searchHistory, setSearchHistory] = useState<string[]>([]);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
@@ -201,6 +250,67 @@ export default function Home() {
   }, [showModelPicker]);
 
   const isConnected = hermesStatus?.connected ?? false;
+
+  // Smart search handler
+  const handleSearch = useCallback(async () => {
+    if (!searchQuery.trim() || isSearching) return;
+    
+    setIsSearching(true);
+    setSearchResult(null);
+    setSelectedSearchPlace(null);
+    setSearchHistory(prev => [searchQuery, ...prev.filter(q => q !== searchQuery)].slice(0, 10));
+
+    try {
+      if (searchMode === 'business') {
+        // Business search with places + web
+        const res = await fetch('/api/search/business', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: searchQuery, location: '' }),
+        });
+        const data = await res.json();
+        setSearchResult({
+          answer: data.answer || 'Không tìm thấy thông tin doanh nghiệp.',
+          sources: data.sources || [],
+          places: data.places || [],
+          query: searchQuery,
+        });
+      } else if (searchMode === 'places') {
+        // Place search using Nominatim
+        const res = await fetch(`/api/search/places?q=${encodeURIComponent(searchQuery)}`);
+        const data = await res.json();
+        setSearchResult({
+          answer: `Tìm thấy ${data.places?.length || 0} địa điểm cho "${searchQuery}"`,
+          sources: [],
+          places: data.places || [],
+          query: searchQuery,
+        });
+      } else {
+        // Smart search (Perplexity-style)
+        const res = await fetch('/api/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: searchQuery }),
+        });
+        const data = await res.json();
+        setSearchResult({
+          answer: data.answer || 'Không tìm thấy kết quả.',
+          sources: data.sources || [],
+          places: data.places || [],
+          query: searchQuery,
+        });
+      }
+    } catch (error) {
+      console.error('Search error:', error);
+      setSearchResult({
+        answer: 'Đã xảy ra lỗi khi tìm kiếm. Vui lòng thử lại.',
+        sources: [],
+        places: [],
+        query: searchQuery,
+      });
+    }
+    setIsSearching(false);
+  }, [searchQuery, searchMode, isSearching]);
 
   // Group skills by category
   const skillsByCategory = skills.reduce<Record<string, Skill[]>>((acc, skill) => {
@@ -353,6 +463,10 @@ export default function Home() {
               <TabsTrigger value="sessions" className="gap-1.5 data-[state=active]:bg-violet-500/20 data-[state=active]:text-violet-300">
                 <Clock className="w-3.5 h-3.5" />
                 Sessions
+              </TabsTrigger>
+              <TabsTrigger value="search" className="gap-1.5 data-[state=active]:bg-orange-500/20 data-[state=active]:text-orange-300">
+                <Search className="w-3.5 h-3.5" />
+                Tìm kiếm
               </TabsTrigger>
             </TabsList>
 
@@ -1048,6 +1162,290 @@ export default function Home() {
                 )}
               </div>
             </TabsContent>
+
+            {/* Search Tab - Perplexity-style Smart Search */}
+            <TabsContent value="search" className="flex-1 mt-0">
+              <div className="space-y-4">
+                {/* Search Header */}
+                <div>
+                  <h2 className="text-xl font-bold flex items-center gap-2">
+                    <Sparkles className="w-5 h-5 text-orange-400" />
+                    Tìm kiếm thông minh
+                  </h2>
+                  <p className="text-sm text-slate-400 mt-1">Tìm kiếm thông tin từ web, địa điểm, cửa hàng, giấy phép kinh doanh — không cần API trả phí</p>
+                </div>
+
+                {/* Search Input */}
+                <div className="relative">
+                  <div className="flex gap-3">
+                    <div className="flex-1 relative">
+                      <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-slate-400" />
+                      <input
+                        type="text"
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === 'Enter') handleSearch(); }}
+                        placeholder="Tìm cửa hàng, địa điểm, giấy phép kinh doanh..."
+                        className="w-full rounded-xl border border-white/10 bg-white/5 pl-12 pr-4 py-3.5 text-sm text-white placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-orange-500/50 focus:border-orange-500/50"
+                        disabled={isSearching}
+                      />
+                    </div>
+                    {/* Search Mode Selector */}
+                    <div className="flex rounded-xl border border-white/10 overflow-hidden">
+                      {[
+                        { mode: 'smart' as const, label: 'Thông minh', icon: Sparkles },
+                        { mode: 'places' as const, label: 'Địa điểm', icon: MapPin },
+                        { mode: 'business' as const, label: 'Doanh nghiệp', icon: Building2 },
+                      ].map((m) => (
+                        <button
+                          key={m.mode}
+                          onClick={() => setSearchMode(m.mode)}
+                          className={`flex items-center gap-1.5 px-3 py-2 text-xs transition-all ${
+                            searchMode === m.mode
+                              ? 'bg-orange-500/20 text-orange-300 border-r border-white/10'
+                              : 'bg-white/5 text-slate-400 hover:bg-white/10 border-r border-white/10 last:border-r-0'
+                          }`}
+                        >
+                          <m.icon className="w-3.5 h-3.5" />
+                          <span className="hidden sm:inline">{m.label}</span>
+                        </button>
+                      ))}
+                    </div>
+                    <Button
+                      onClick={handleSearch}
+                      disabled={isSearching || !searchQuery.trim()}
+                      data-search-btn
+                      className="px-5 rounded-xl bg-gradient-to-r from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 text-white shadow-lg shadow-orange-500/20"
+                    >
+                      {isSearching ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Search className="w-4 h-4" />
+                      )}
+                    </Button>
+                  </div>
+                </div>
+
+                {/* Quick Search Suggestions */}
+                {!searchResult && !isSearching && (
+                  <div className="space-y-4">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                      {[
+                        { icon: Building2, text: 'Cửa hàng tiện lợi tại TP.HCM', mode: 'places' as const, color: 'text-emerald-400 bg-emerald-500/10' },
+                        { icon: FileCheck, text: 'Giấy phép kinh doanh quán cafe', mode: 'business' as const, color: 'text-amber-400 bg-amber-500/10' },
+                        { icon: MapPin, text: 'Nhà hàng Quận 1 TP.HCM', mode: 'places' as const, color: 'text-cyan-400 bg-cyan-500/10' },
+                        { icon: BookOpen, text: 'Quy định đăng ký kinh doanh 2026', mode: 'smart' as const, color: 'text-violet-400 bg-violet-500/10' },
+                        { icon: Building2, text: 'Phòng khám tư nhân Hà Nội', mode: 'business' as const, color: 'text-rose-400 bg-rose-500/10' },
+                        { icon: Lightbulb, text: 'Xu hướng kinh doanh năm 2026', mode: 'smart' as const, color: 'text-orange-400 bg-orange-500/10' },
+                      ].map((suggestion, i) => (
+                        <motion.button
+                          key={i}
+                          initial={{ opacity: 0, y: 10 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          transition={{ delay: i * 0.05 }}
+                          onClick={() => {
+                            setSearchQuery(suggestion.text);
+                            setSearchMode(suggestion.mode);
+                            // Auto-search: set query param and trigger via ref
+                            setTimeout(() => {
+                              const searchBtn = document.querySelector('[data-search-btn]') as HTMLButtonElement;
+                              if (searchBtn) searchBtn.click();
+                            }, 200);
+                          }}
+                          className="flex items-center gap-3 p-3 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 transition-all text-left group"
+                        >
+                          <div className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${suggestion.color}`}>
+                            <suggestion.icon className="w-4 h-4" />
+                          </div>
+                          <span className="text-sm text-slate-300 group-hover:text-white transition-colors">{suggestion.text}</span>
+                        </motion.button>
+                      ))}
+                    </div>
+
+                    {/* Search History */}
+                    {searchHistory.length > 0 && (
+                      <div>
+                        <h3 className="text-xs text-slate-500 uppercase tracking-wider mb-2">Tìm kiếm gần đây</h3>
+                        <div className="flex flex-wrap gap-2">
+                          {searchHistory.slice(0, 5).map((q, i) => (
+                            <button
+                              key={i}
+                              onClick={() => setSearchQuery(q)}
+                              className="px-3 py-1 rounded-full border border-white/10 bg-white/5 text-xs text-slate-400 hover:text-white hover:bg-white/10 transition-all"
+                            >
+                              {q}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* How it works */}
+                    <Card className="bg-black/30 border-white/10 backdrop-blur-sm">
+                      <CardContent className="p-5">
+                        <h3 className="text-sm font-medium text-slate-300 mb-3">Cách hoạt động</h3>
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                          <div className="flex items-start gap-2">
+                            <div className="w-6 h-6 rounded-full bg-orange-500/20 flex items-center justify-center shrink-0 text-xs text-orange-400 font-bold">1</div>
+                            <div>
+                              <p className="text-xs font-medium text-slate-300">Tìm kiếm web</p>
+                              <p className="text-[10px] text-slate-500">z-ai-web-dev-sdk tìm kiếm nhiều nguồn</p>
+                            </div>
+                          </div>
+                          <div className="flex items-start gap-2">
+                            <div className="w-6 h-6 rounded-full bg-orange-500/20 flex items-center justify-center shrink-0 text-xs text-orange-400 font-bold">2</div>
+                            <div>
+                              <p className="text-xs font-medium text-slate-300">Đọc & phân tích</p>
+                              <p className="text-[10px] text-slate-500">Qwen 3.5 Flash tổng hợp thông tin</p>
+                            </div>
+                          </div>
+                          <div className="flex items-start gap-2">
+                            <div className="w-6 h-6 rounded-full bg-orange-500/20 flex items-center justify-center shrink-0 text-xs text-orange-400 font-bold">3</div>
+                            <div>
+                              <p className="text-xs font-medium text-slate-300">Trả lời + Bản đồ</p>
+                              <p className="text-[10px] text-slate-500">OpenStreetMap hiển thị địa điểm</p>
+                            </div>
+                          </div>
+                        </div>
+                      </CardContent>
+                    </Card>
+                  </div>
+                )}
+
+                {/* Loading State */}
+                {isSearching && (
+                  <div className="flex flex-col items-center justify-center py-16">
+                    <div className="w-16 h-16 rounded-2xl bg-orange-500/10 border border-orange-500/20 flex items-center justify-center mb-4">
+                      <Loader2 className="w-8 h-8 text-orange-400 animate-spin" />
+                    </div>
+                    <p className="text-sm text-slate-400 mb-2">Đang tìm kiếm...</p>
+                    <div className="flex items-center gap-4 text-xs text-slate-500">
+                      <span className="flex items-center gap-1"><Globe className="w-3 h-3" /> Tìm kiếm web</span>
+                      <span className="flex items-center gap-1"><BookOpen className="w-3 h-3" /> Đọc trang</span>
+                      <span className="flex items-center gap-1"><Brain className="w-3 h-3" /> AI tổng hợp</span>
+                    </div>
+                  </div>
+                )}
+
+                {/* Search Results */}
+                {searchResult && !isSearching && (
+                  <div className="space-y-4">
+                    {/* Sources Bar */}
+                    {searchResult.sources.length > 0 && (
+                      <div>
+                        <h3 className="text-xs text-slate-500 uppercase tracking-wider mb-2">Nguồn tham khảo</h3>
+                        <div className="flex gap-2 overflow-x-auto pb-2">
+                          {searchResult.sources.slice(0, 8).map((source) => (
+                            <a
+                              key={source.id}
+                              href={source.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="flex items-center gap-2 px-3 py-2 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 transition-all shrink-0 max-w-[200px]"
+                            >
+                              <div className="w-5 h-5 rounded bg-orange-500/20 flex items-center justify-center shrink-0">
+                                <span className="text-[9px] text-orange-400 font-bold">{source.id}</span>
+                              </div>
+                              <div className="min-w-0">
+                                <p className="text-[10px] text-slate-300 truncate">{source.name}</p>
+                                <p className="text-[9px] text-slate-600 truncate">{source.host_name || source.url}</p>
+                              </div>
+                            </a>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                      {/* AI Answer Panel */}
+                      <div className={`${searchResult.places.length > 0 ? 'lg:col-span-2' : 'lg:col-span-3'}`}>
+                        <Card className="bg-black/30 border-white/10 backdrop-blur-sm">
+                          <CardHeader className="pb-3">
+                            <CardTitle className="text-sm font-medium flex items-center gap-2">
+                              <Sparkles className="w-4 h-4 text-orange-400" />
+                              Kết quả tìm kiếm
+                              <Badge variant="outline" className="text-[9px] px-1.5 py-0 ml-auto border-white/10 text-slate-400">
+                                {searchResult.sources.length} nguồn
+                              </Badge>
+                            </CardTitle>
+                          </CardHeader>
+                          <CardContent>
+                            <div className="prose prose-invert prose-sm max-w-none text-slate-200 leading-relaxed whitespace-pre-wrap">
+                              {searchResult.answer}
+                            </div>
+                          </CardContent>
+                        </Card>
+                      </div>
+
+                      {/* Map Panel - show when there are places */}
+                      {searchResult.places.length > 0 && (
+                        <div className="space-y-3">
+                          <Card className="bg-black/30 border-white/10 backdrop-blur-sm overflow-hidden">
+                            <div className="h-64">
+                              <MapComponent
+                                places={searchResult.places}
+                                selectedPlace={selectedSearchPlace}
+                                onPlaceSelect={(place) => setSelectedSearchPlace(place)}
+                              />
+                            </div>
+                          </Card>
+                          
+                          {/* Places List */}
+                          <Card className="bg-black/30 border-white/10 backdrop-blur-sm">
+                            <CardHeader className="pb-2">
+                              <CardTitle className="text-xs font-medium flex items-center gap-2">
+                                <MapPin className="w-3.5 h-3.5 text-orange-400" />
+                                Địa điểm ({searchResult.places.length})
+                              </CardTitle>
+                            </CardHeader>
+                            <CardContent>
+                              <ScrollArea className="max-h-64">
+                                <div className="space-y-2">
+                                  {searchResult.places.map((place) => (
+                                    <button
+                                      key={place.id}
+                                      onClick={() => setSelectedSearchPlace(place)}
+                                      className={`w-full text-left p-2.5 rounded-lg border transition-all ${
+                                        selectedSearchPlace?.id === place.id
+                                          ? 'border-orange-500/50 bg-orange-500/10'
+                                          : 'border-white/5 bg-white/5 hover:bg-white/10'
+                                      }`}
+                                    >
+                                      <div className="flex items-start gap-2">
+                                        <MapPin className="w-3.5 h-3.5 text-orange-400 mt-0.5 shrink-0" />
+                                        <div className="min-w-0">
+                                          <p className="text-xs font-medium text-slate-200 truncate">{place.name}</p>
+                                          <p className="text-[10px] text-slate-500 truncate">{place.fullAddress?.split(',').slice(0, 3).join(',')}</p>
+                                          <div className="flex items-center gap-2 mt-1">
+                                            {place.phone && (
+                                              <span className="flex items-center gap-0.5 text-[9px] text-slate-400">
+                                                <Phone className="w-2.5 h-2.5" />
+                                                {place.phone}
+                                              </span>
+                                            )}
+                                            {place.website && (
+                                              <a href={place.website} target="_blank" rel="noopener noreferrer" className="flex items-center gap-0.5 text-[9px] text-cyan-400 hover:text-cyan-300" onClick={(e) => e.stopPropagation()}>
+                                                <ExternalLink className="w-2.5 h-2.5" />
+                                                Website
+                                              </a>
+                                            )}
+                                          </div>
+                                        </div>
+                                      </div>
+                                    </button>
+                                  ))}
+                                </div>
+                              </ScrollArea>
+                            </CardContent>
+                          </Card>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </TabsContent>
+
           </Tabs>
         </main>
 

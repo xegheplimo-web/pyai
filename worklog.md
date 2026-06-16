@@ -56,3 +56,37 @@ Stage Summary:
 - Model picker dropdown in header allows switching between Qwen 3.5 Flash and Hermes Agent
 - API route routes to correct provider based on model selection
 - Qwen uses OpenAI-compatible endpoint at ws-09yuoi7zzbynceax.ap-southeast-1.maas.aliyuncs.com
+
+---
+Task ID: 3
+Agent: Super Z (main)
+Task: Build Perplexity-style smart search system with place/business search on OpenStreetMap
+
+Work Log:
+- Installed Leaflet + react-leaflet for OpenStreetMap rendering (no API key needed)
+- Created /api/search route - Smart search: web search via z-ai-web-dev-sdk → read top pages → AI synthesis with Qwen 3.5 Flash
+- Created /api/search/places route - Nominatim (OpenStreetMap) geocoding + Overpass API for POI search
+- Created /api/search/business route - Combined business info search: Nominatim + web search + AI synthesis
+- Created MapComponent.tsx - Dynamic Leaflet map with markers, popups, and place selection
+- Added Leaflet CSS import in layout.tsx for proper styling
+- Added Search tab (5th tab) with Perplexity-style UI:
+  - Search input with 3 mode selector (Thông minh, Địa điểm, Doanh nghiệp)
+  - 6 quick search suggestions with auto-search on click
+  - Search history tracking
+  - "Cách hoạt động" explanation card
+  - Loading state with step indicators
+  - Sources bar with citation links
+  - AI answer panel with synthesized content
+  - OpenStreetMap map panel showing found places
+  - Places list with phone, website, and address info
+- Fixed rate limiting: Changed web_reader from parallel to batched processing (2 at a time with 500ms delay)
+- Fixed quick suggestion auto-search: Uses data-search-btn attribute to trigger click after state update
+- Verified with Agent Browser: All UI elements render correctly, search flow works
+
+Stage Summary:
+- 3 search modes: Smart (Perplexity-style), Places (Nominatim), Business (combined)
+- No paid APIs required: OpenStreetMap/Nominatim/Overpass are all free
+- Web search via z-ai-web-dev-sdk + AI synthesis via Qwen 3.5 Flash
+- Interactive Leaflet map with markers and popups
+- Source citations with clickable links
+- Auto-search on suggestion click
